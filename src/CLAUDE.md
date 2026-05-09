@@ -137,11 +137,15 @@ Funciones principales:
 
 Mejora prevista al migrar a lilyorugabasz (T-Watch):
 - T-Watch lee NeuroSky MindWave Mobile via Bluetooth Classic SPP
-  (ya existe en proyecto lilygosz: integracion BT NeuroSky)
+  (referencia: lilygosz/src/Neurowatch/main.cpp — BT SPP + parser
+  ThinkGear ya implementado y probado)
 - Eliminar I2C y handshake con pin listo9 — todo es interno al T-Watch
 - Mantener el parser ThinkGear (sync, checksum, payload 0x02/0x04/0x05/0x83)
 - Las bandas EEG quedan disponibles directamente para maszter sin
   conversion a uint16 (se puede usar unsigned long sin perdida)
+- ARQUITECTURA DUAL-CORE (ver seccion separada al final de este archivo):
+  el sensor BT corre en Core 0 con FreeRTOS, el resto (UI + maszter
+  + crawler ESP-NOW) en Core 1 (loop principal).
 
 ----------------------------------------------------------------
 4. CRAWLER (02_crawler/main.cpp) — robot oruga
@@ -188,3 +192,136 @@ Mejora prevista al migrar a orugabasz (XIAO ESP32-C3):
 - Mantener libreria Servo (compatible con ESP32) o migrar a ESP32Servo
 - Estructura de comandos similar: {movicrawler, ledszdato} → solo cambia
   la capa de transporte
+
+
+==========================================================================
+ARQUITECTURA DUAL-CORE EN lilyorugabasz (T-Watch ESP32)
+==========================================================================
+
+Referencia: c:\Users\rodri\Documents\PlatformIO\Projects\lilygosz\src\Neurowatch\main.cpp
+(programa ya probado — base para HD9BAsensor en lilyorugabasz)
+
+El ESP32 del T-Watch tiene dos cores. Para evitar que el parser BT
+(que tiene timing critico) sea interrumpido por la UI/LVGL, las
+estadisticas, ESP-NOW al crawler, etc., se separa el trabajo:
+
+----------------------------------------------------------------
+CORE 0 — Sensor EEG MindWave (FreeRTOS task dedicada)
+----------------------------------------------------------------
+- Lectura de bytes Bluetooth Classic SPP del MindWave Mobile
+- Parser ThinkGear (state machine: WAIT_SYNC1 → WAIT_SYNC2 →
+  WAIT_PLENGTH → READ_PAYLOAD → WAIT_CHECKSUM)
+- Validacion checksum (one's complement)
+- Parseo de payload: 0x02 poorSignal, 0x04 attention, 0x05 meditation,
+  0x16 blink, 0x80 raw, 0x83 ASIC_EEG_POWER (8 bandas x 3 bytes)
+- Calculo de formulas neuro: indiceFatiga = (theta+alpha)/beta,
+  ratioCarga = beta/alpha
+- (Opcional) Escritura periodica a SD cada 1s con timestamp cacheado
+
+Codigo clave:
+  xTaskCreatePinnedToCore(
+    btSdTask,        // funcion de la tarea
+    "BT_SD",         // nombre
+    8192,            // stack (bytes)
+    NULL,            // parametro
+    1,               // prioridad
+    &btTaskHandle,   // handle
+    0                // <-- Core 0
+  );
+
+Loop interno de la tarea Core 0:
+  while (btTaskRunning) {
+    if (btConnected && SerialBT.connected()) {
+      while (SerialBT.available() > 0) {
+        parseByte(SerialBT.read());
+      }
+    }
+    // ... otras tareas independientes (ej. SD)
+    vTaskDelay(pdMS_TO_TICKS(1));  // ceder al stack BT/WiFi
+  }
+
+----------------------------------------------------------------
+CORE 1 — UI, Maszter y ESP-NOW al crawler (loop principal)
+----------------------------------------------------------------
+- loop() de Arduino corre en Core 1 por defecto
+- Renderizado pantalla TFT touch (LVGL o TFT_eSPI directo)
+- Maquina de estados maszter (semaforo: A vs B, secuencias,
+  promedios con libreria Statistic)
+- Lectura touch, botones, vibrador (DRV2605L via I2C)
+- ESP-NOW: enviar comandos al XIAO ESP32-C3 (orugabasz/crawler)
+- Acceso al RTC del T-Watch via I2C (no concurrente con Core 0)
+- Recibir ack del crawler (pulsosz, finpulsosz, etc.) por ESP-NOW
+
+----------------------------------------------------------------
+SINCRONIZACION ENTRE CORES — mutex + struct compartido
+----------------------------------------------------------------
+Patron usado en Neurowatch (replicar en lilyorugabasz):
+
+1. Struct compartido NeuroData con todos los valores parseados
+   (poorSignal, attention, meditation, 8 bandas EEG, contadores,
+   timestamp ultimo paquete).
+
+2. Tres mutex FreeRTOS:
+   - neuroMutex    → protege el struct NeuroData
+   - sdMutex       → protege archivo SD (si se usa)
+   - rtcCacheMutex → protege timestamp cacheado del RTC
+
+3. Inicializacion en setup() (Core 1):
+     neuroMutex    = xSemaphoreCreateMutex();
+     sdMutex       = xSemaphoreCreateMutex();
+     rtcCacheMutex = xSemaphoreCreateMutex();
+
+4. Core 0 escribe en NeuroData tras parsear cada paquete:
+     if (xSemaphoreTake(neuroMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+       neuroShared.meditation = meditation;
+       neuroShared.eegTheta   = eegTheta;
+       // ... resto de campos
+       xSemaphoreGive(neuroMutex);
+     }
+
+5. Core 1 (loop) llama readNeuroData() para copiar datos frescos
+   a las variables globales que usa la UI/maszter:
+     void readNeuroData() {
+       if (xSemaphoreTake(neuroMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+         meditation = neuroShared.meditation;
+         eegTheta   = neuroShared.eegTheta;
+         // ...
+         xSemaphoreGive(neuroMutex);
+       }
+     }
+
+6. RTC cacheado: I2C es accedido SOLO desde Core 1. Core 1 actualiza
+   cachedFecha/cachedHora cada 1s; Core 0 lee el cache (no toca I2C
+   directamente, evita conflictos en el bus).
+
+----------------------------------------------------------------
+REGLAS PARA NO ROMPER EL DUAL-CORE
+----------------------------------------------------------------
+- Core 0 NUNCA accede a I2C, TFT, ni perifericos del T-Watch
+  (solo lee BT y opcionalmente escribe SD via SPI dedicado)
+- Toda lectura/escritura de variables compartidas pasa por mutex
+  con timeout corto (5-20 ms maximo) para no bloquear
+- vTaskDelay(pdMS_TO_TICKS(1)) en el bucle de Core 0 es OBLIGATORIO
+  para que el stack interno de BT/WiFi pueda correr
+- Variables compartidas declarar como `volatile` cuando son flags
+  simples (btConnected, btTaskRunning)
+- Para detener limpiamente la tarea Core 0 antes de cerrar BT/SD:
+    btTaskRunning = false;
+    // esperar a que la tarea termine antes de proceder
+- Stack 8192 bytes es suficiente para parser ThinkGear + escritura
+  SD; si se agrega mas trabajo a Core 0 considerar aumentar
+
+----------------------------------------------------------------
+PLAN DE INTEGRACION HD9BAsensor → lilyorugabasz
+----------------------------------------------------------------
+1. Copiar el parser ThinkGear de Neurowatch (parseByte, parsePayload,
+   state machine) tal cual — ya esta validado.
+2. Copiar la estructura NeuroData y el patron mutex/Core 0.
+3. Eliminar la parte de SD si por ahora no se necesita logging
+   (se puede agregar despues).
+4. En el loop principal (Core 1), agregar la maquina de estados
+   maszter y la UI nueva (reemplazo de Nextion).
+5. Agregar ESP-NOW como salida hacia el XIAO (orugabasz/crawler)
+   en lugar del envio mesh original.
+6. Verificar prioridades: la tarea BT puede subir a prioridad 2
+   si el parser pierde paquetes con UI muy cargada.
