@@ -50,7 +50,12 @@ uint8_t puenteMAC[6] = { 0x5C, 0x01, 0x3B, 0x34, 0x93, 0x1C };
 #define ESPNOW_CHANNEL    1
 #define LINK_TIMEOUT_MS   3000UL    // si no llega paquete en 3s → link DOWN
 #define UMBRAL_TX_DEBOUNCE_MS  300UL
-#define VIBRATE_DURATION_MS    3000UL
+
+// Vibracion "Eco Mindful": 3 pulsos de intensidad decreciente espaciados
+// por pausas de silencio. Total ~2.4 s; el banner UI permanece 3 s.
+#define VIBRATE_BANNER_MS      3000UL
+#define VIBRATE_PULSE_INTERVAL_MS  800UL
+#define VIBRATE_PULSES_TOTAL   3
 
 // ════════════════════════════════════════════════════════════════════════════
 //  PROTOCOLO ESP-NOW (debe coincidir con puentesz)
@@ -99,7 +104,22 @@ uint32_t umbralLastChange= 0;
 
 // Sesion (pagina 3)
 Preferences prefs;
-uint32_t numeroSesion    = 1;
+
+// Log circular de sesiones cerradas en NVS del T-Watch.
+//   - sesion actual NO esta en el log (es la que esta en curso).
+//   - log[0] = mas reciente cerrada; log[count-1] = mas antigua.
+//   - HIST_LEN = 50 entradas × 8 bytes = 400 bytes, holgado para NVS.
+#define HIST_LEN 50
+typedef struct __attribute__((packed)) {
+    uint32_t num;          // numero de sesion
+    uint16_t cohFinales;   // coherencias al cerrar
+    uint16_t reservado;    // alineacion + uso futuro (duracion/timestamp)
+} SesionEntry;
+
+SesionEntry sesionLog[HIST_LEN] = {0};
+uint8_t     sesionCount   = 0;      // cuantas entradas validas hay (0..HIST_LEN)
+uint32_t    sesionActual  = 1;      // numero de la sesion en curso
+uint8_t     viewIdx       = 0;      // 0 = actual; 1..count = guardadas (mas reciente → mas antigua)
 
 // Maquina de estados del boton NUEVA SESION (pagina 3)
 //   IDLE        → muestra "NUEVA SESION"
@@ -110,14 +130,17 @@ enum SesionBtnState { SBTN_IDLE, SBTN_CONFIRM, SBTN_WAIT_ECHO, SBTN_OK, SBTN_FAI
 SesionBtnState sesionBtn      = SBTN_IDLE;
 uint32_t       sesionBtnSince = 0;
 uint32_t       seqAlPedir     = 0;     // paqueteRx.seq al enviar el reset; OK = seq nuevo + numCoh=0
+uint16_t       cohAlGuardar   = 0;     // snapshot de coherencias para grabar en el log
 
 #define CONFIRM_WINDOW_MS    3000UL
 #define ECHO_TIMEOUT_MS      2000UL
 #define RESULT_DISPLAY_MS    1500UL
 
-// Vibracion (no bloqueante)
-bool     vibrando        = false;
-uint32_t vibrateStart    = 0;
+// Vibracion (no bloqueante, patron de 3 pulsos)
+bool     vibrando         = false;
+uint32_t vibrateStart     = 0;
+uint8_t  vibratePulsesDone = 0;
+uint32_t vibrateLastPulse = 0;
 
 // UI
 uint8_t  currentPage     = 0;   // 0=menu, 1=datos, 2=umbral, 3=sesion
@@ -170,7 +193,14 @@ Boton btnUp   = {  30, 100,  70, 70 };
 Boton btnDown = { 140, 100,  70, 70 };
 
 // Pagina 3
-Boton btnGuardar = { 20, 170, 200, 50 };
+//   Layout vertical (pantalla 240x240, header 0-28):
+//     35-55:   etiqueta "Sesion ACTUAL" o "N/M"
+//     65-115:  numero de sesion grande
+//     125-175: zona de navegacion (flechas laterales + coherencias en centro)
+//     180-218: boton NUEVA SESION
+Boton btnPrevSes = {   5, 125, 55, 50 };   // flecha izq (mas reciente)
+Boton btnNextSes = { 180, 125, 55, 50 };   // flecha der (mas antigua)
+Boton btnGuardar = {  20, 185, 200, 38 };  // NUEVA SESION
 
 // ════════════════════════════════════════════════════════════════════════════
 //  ESP-NOW CALLBACKS (ISR-context: minimo trabajo)
@@ -215,21 +245,42 @@ void enviarResetAB() {
 //  VIBRACION (no bloqueante)
 // ════════════════════════════════════════════════════════════════════════════
 
+// Efectos DRV2605 por pulso, intensidad decreciente:
+//   pulso 0 → Strong Buzz 100%   (efecto 14): firme y claro, ~1s
+//   pulso 1 → Strong Click 100%  (efecto 1):  confirmacion clara
+//   pulso 2 → Medium Click 60%   (efecto 23): eco perceptible que cierra
+static const uint8_t VIBRATE_PATTERN[VIBRATE_PULSES_TOTAL] = { 14, 1, 23 };
+
+static void firePulse(uint8_t idx) {
+    if (!watch || !watch->drv) return;
+    watch->drv->setWaveform(0, VIBRATE_PATTERN[idx]);
+    watch->drv->setWaveform(1, 0);   // end of sequence
+    watch->drv->go();
+}
+
 void vibrarStart() {
     if (!watch || !watch->drv) return;
-    // Efecto 118 = "Long buzz for programmatic stopping" — 100%.
-    // Una sola llamada → buzz continuo hasta que llamemos a stop().
-    watch->drv->setWaveform(0, 118);
-    watch->drv->setWaveform(1, 0);
-    watch->drv->go();
-    vibrando      = true;
-    vibrateStart  = millis();
+    vibrando          = true;
+    vibrateStart      = millis();
+    vibrateLastPulse  = vibrateStart;
+    vibratePulsesDone = 1;
+    firePulse(0);
 }
 
 void vibrarTick(uint32_t now) {
     if (!vibrando) return;
-    if (now - vibrateStart >= VIBRATE_DURATION_MS) {
-        if (watch && watch->drv) watch->drv->stop();
+
+    // Disparar pulsos siguientes con la cadencia ergonomica
+    if (vibratePulsesDone < VIBRATE_PULSES_TOTAL &&
+        now - vibrateLastPulse >= VIBRATE_PULSE_INTERVAL_MS) {
+        firePulse(vibratePulsesDone);
+        vibratePulsesDone++;
+        vibrateLastPulse = now;
+    }
+
+    // Terminar cuando ya pasaron los 3 pulsos + tiempo del banner
+    if (vibratePulsesDone >= VIBRATE_PULSES_TOTAL &&
+        now - vibrateStart >= VIBRATE_BANNER_MS) {
         vibrando = false;
     }
 }
@@ -441,62 +492,153 @@ void drawSesionButton() {
     tft->fillRoundRect(btnGuardar.x, btnGuardar.y, btnGuardar.w, btnGuardar.h, 8, col);
     tft->drawRoundRect(btnGuardar.x, btnGuardar.y, btnGuardar.w, btnGuardar.h, 8, TFT_WHITE);
     tft->setTextDatum(MC_DATUM);
-    tft->setTextFont(4);
+    tft->setTextFont(2);
     tft->setTextColor(sesionBtn == SBTN_CONFIRM ? TFT_BLACK : TFT_WHITE, col);
     tft->drawString(label, btnGuardar.x + btnGuardar.w/2,
                     btnGuardar.y + btnGuardar.h/2);
+}
+
+void drawArrowSes(const Boton &b, bool left, bool habilitado) {
+    uint16_t col = habilitado ? COLOR_BTN2 : COLOR_PANEL;
+    tft->fillRoundRect(b.x, b.y, b.w, b.h, 6, col);
+    tft->drawRoundRect(b.x, b.y, b.w, b.h, 6,
+                       habilitado ? TFT_WHITE : COLOR_LABEL);
+    int cx = b.x + b.w/2;
+    int cy = b.y + b.h/2;
+    uint16_t triCol = habilitado ? TFT_WHITE : COLOR_LABEL;
+    if (left) {
+        tft->fillTriangle(cx-12, cy, cx+10, cy-15, cx+10, cy+15, triCol);
+    } else {
+        tft->fillTriangle(cx+12, cy, cx-10, cy-15, cx-10, cy+15, triCol);
+    }
 }
 
 void drawPage3Full() {
     tft->fillScreen(COLOR_BG);
     drawHeader("SESION", true);
 
+    // Etiqueta "Coherencias" centrada entre las flechas
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(2);
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->drawString("Sesion #",      120,  55);
-    tft->drawString("Coherencias",   120, 120);
+    tft->drawString("Coherencias", 120, 132);
 
     drawSesionButton();
 }
 
 void drawPage3Update() {
-    char buf[16];
-    // Numero de sesion
-    tft->fillRect(60, 70, 120, 32, COLOR_BG);
-    snprintf(buf, sizeof(buf), "%lu", (unsigned long)numeroSesion);
+    char buf[24];
+
+    // Determinar que sesion mostrar y si es "actual" o de log
+    uint32_t mostrarNum;
+    uint16_t mostrarCoh;
+    bool     esActual = (viewIdx == 0);
+    if (esActual) {
+        mostrarNum = sesionActual;
+        mostrarCoh = uiNumCoherencias;
+    } else {
+        uint8_t idx = viewIdx - 1;
+        if (idx >= sesionCount) idx = 0;
+        mostrarNum = sesionLog[idx].num;
+        mostrarCoh = sesionLog[idx].cohFinales;
+    }
+
+    // Etiqueta "Sesion N de M" (cabecera de la vista de log)
+    tft->fillRect(0, 35, 240, 22, COLOR_BG);
+    if (esActual) {
+        snprintf(buf, sizeof(buf), "Sesion ACTUAL");
+    } else {
+        snprintf(buf, sizeof(buf), "Sesion %u/%u",
+                 (unsigned)viewIdx, (unsigned)sesionCount);
+    }
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(esActual ? COLOR_ACCENT : COLOR_LABEL, COLOR_BG);
+    tft->drawString(buf, 120, 46);
+
+    // Numero de sesion grande
+    tft->fillRect(50, 65, 140, 50, COLOR_BG);
+    snprintf(buf, sizeof(buf), "#%lu", (unsigned long)mostrarNum);
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(6);
     tft->setTextColor(COLOR_VALUE, COLOR_BG);
-    tft->drawString(buf, 120, 85);
+    tft->drawString(buf, 120, 90);
 
-    // Coherencias de la sesion (vienen de A → B → C; se acumulan mientras A no se reinicia)
-    tft->fillRect(60, 135, 120, 32, COLOR_BG);
-    snprintf(buf, sizeof(buf), "%u", (unsigned)uiNumCoherencias);
-    tft->setTextColor(COLOR_ACCENT, COLOR_BG);
-    tft->drawString(buf, 120, 150);
+    // Flechas (con estado habilitado/deshabilitado)
+    bool puedeIzq = (viewIdx > 0);                          // ir hacia mas reciente (actual)
+    bool puedeDer = (viewIdx < sesionCount);                // ir hacia mas antigua
+    drawArrowSes(btnPrevSes, true,  puedeIzq);
+    drawArrowSes(btnNextSes, false, puedeDer);
+
+    // Coherencias (valor grande, color segun fuente). Solo cubre el espacio entre flechas.
+    tft->fillRect(65, 145, 110, 32, COLOR_BG);
+    snprintf(buf, sizeof(buf), "%u", (unsigned)mostrarCoh);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(4);
+    tft->setTextColor(esActual ? COLOR_ACCENT : COLOR_VALUE, COLOR_BG);
+    tft->drawString(buf, 120, 160);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 //  TRANSICIONES
 // ════════════════════════════════════════════════════════════════════════════
 
+// ─── Log de sesiones (NVS) ──────────────────────────────────────────────
+
+void cargarLogSesiones() {
+    sesionCount  = (uint8_t) prefs.getUChar("scnt", 0);
+    if (sesionCount > HIST_LEN) sesionCount = 0;
+    sesionActual = prefs.getUInt("snext", 1);
+    if (sesionCount > 0) {
+        size_t expected = sizeof(SesionEntry) * sesionCount;
+        size_t got = prefs.getBytes("slog", sesionLog, expected);
+        if (got != expected) {
+            sesionCount = 0;   // corrupcion → empezar limpio
+        }
+    }
+    Serial.printf("[NVS] log: %u sesiones, proxima=#%lu\n",
+                  (unsigned)sesionCount, (unsigned long)sesionActual);
+}
+
+void guardarLogSesiones() {
+    prefs.putUChar("scnt", sesionCount);
+    prefs.putUInt ("snext", sesionActual);
+    if (sesionCount > 0) {
+        prefs.putBytes("slog", sesionLog, sizeof(SesionEntry) * sesionCount);
+    }
+}
+
+// Anade una entrada al frente del log (mas reciente), desplazando las demas.
+void anadirSesionAlLog(uint32_t num, uint16_t coh) {
+    uint8_t copyLen = sesionCount;
+    if (copyLen >= HIST_LEN) copyLen = HIST_LEN - 1;   // descarta la mas antigua
+    for (int8_t i = copyLen; i > 0; i--) {
+        sesionLog[i] = sesionLog[i - 1];
+    }
+    sesionLog[0].num        = num;
+    sesionLog[0].cohFinales = coh;
+    sesionLog[0].reservado  = 0;
+    if (sesionCount < HIST_LEN) sesionCount++;
+    guardarLogSesiones();
+}
+
 void setPage(uint8_t newPage) {
     currentPage    = newPage;
     needFullRedraw = true;
-    // Salir de pagina 3 → cancelar cualquier confirmacion pendiente
-    if (newPage != 3) sesionBtn = SBTN_IDLE;
+    // Salir de pagina 3 → cancelar confirmacion + volver a vista "actual"
+    if (newPage != 3) {
+        sesionBtn = SBTN_IDLE;
+        viewIdx   = 0;
+    }
 }
 
 void confirmarNuevaSesion() {
-    // Capturar seq actual: el eco del reset llegara en un seq posterior
-    seqAlPedir = paqueteRx.seq;
+    // Snapshot del contador actual: lo guardaremos en el log SOLO si A confirma el reset.
+    cohAlGuardar = uiNumCoherencias;
+    seqAlPedir   = paqueteRx.seq;
 
-    numeroSesion++;
-    prefs.putUInt("nses", numeroSesion);
-    Serial.printf("[NVS] sesion guardada → ahora #%lu\n", (unsigned long)numeroSesion);
-
-    // Resetear contador en A via B
+    // Pedir reset a A via B (todavia no incrementamos sesionActual ni grabamos
+    // en NVS: si A no responde queremos quedarnos en la sesion actual).
     enviarResetAB();
 
     sesionBtn      = SBTN_WAIT_ECHO;
@@ -532,6 +674,16 @@ void tickSesionBtn(uint32_t now) {
         case SBTN_WAIT_ECHO:
             // Eco exitoso: llego un paquete POSTERIOR al envio con numCoherencias=0
             if (paqueteRx.seq > seqAlPedir && uiNumCoherencias == 0) {
+                // Confirmado por A → recien ahora persistimos la sesion cerrada
+                // y avanzamos el contador. Si timeout-eamos no se toca nada.
+                anadirSesionAlLog(sesionActual, cohAlGuardar);
+                sesionActual++;
+                guardarLogSesiones();
+                Serial.printf("[NVS] sesion #%lu cerrada con %u coherencias; proxima=#%lu\n",
+                              (unsigned long)(sesionActual - 1),
+                              (unsigned)cohAlGuardar,
+                              (unsigned long)sesionActual);
+                needFullRedraw = true;   // refresca pagina entera (numeros nuevos)
                 sesionBtn      = SBTN_OK;
                 sesionBtnSince = now;
                 drawSesionButton();
@@ -613,7 +765,7 @@ void setup() {
 
     // NVS
     prefs.begin("watchcoh", false);
-    numeroSesion = prefs.getUInt("nses", 1);
+    cargarLogSesiones();
     umbralLocal  = (uint8_t)prefs.getUChar("umbr", 60);
     if (umbralLocal < 40 || umbralLocal > 99) umbralLocal = 60;
 
@@ -671,6 +823,18 @@ void handleTouch(int16_t tx, int16_t ty) {
         case 3:
             if (btnGuardar.dentro(tx, ty)) {
                 onSesionTap();
+            } else if (btnPrevSes.dentro(tx, ty)) {
+                // Flecha izq → vista mas reciente (idx menor; 0 = actual)
+                if (viewIdx > 0) {
+                    viewIdx--;
+                    drawPage3Update();
+                }
+            } else if (btnNextSes.dentro(tx, ty)) {
+                // Flecha der → vista mas antigua (idx mayor, hasta sesionCount)
+                if (viewIdx < sesionCount) {
+                    viewIdx++;
+                    drawPage3Update();
+                }
             }
             break;
     }
