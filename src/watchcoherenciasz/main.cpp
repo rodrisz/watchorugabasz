@@ -50,6 +50,7 @@ uint8_t puenteMAC[6] = { 0x5C, 0x01, 0x3B, 0x34, 0x93, 0x1C };
 #define ESPNOW_CHANNEL    1
 #define LINK_TIMEOUT_MS   3000UL    // si no llega paquete en 3s → link DOWN
 #define UMBRAL_TX_DEBOUNCE_MS  300UL
+#define BATTERY_POLL_MS        2000UL    // refrescar lectura cada 2s
 
 // Vibracion "Eco Mindful": 3 pulsos de intensidad decreciente espaciados
 // por pausas de silencio. Total ~2.4 s; el banner UI permanece 3 s.
@@ -105,6 +106,29 @@ uint32_t umbralLastChange= 0;
 // Sesion (pagina 3)
 Preferences prefs;
 
+// ─── Multi-usuario ──────────────────────────────────────────────────────
+// 8 usuarios maximo. Cada uno tiene su propio log de sesiones, contador de
+// proxima sesion y umbral. El usuario activo se persiste en NVS clave "uact".
+//
+// Claves NVS por usuario u (0..7): slog<u>, scnt<u>, snext<u>, umbr<u>.
+//
+// El cronometro de sesion en curso y el contador (uiNumCoherencias, que
+// viene de A) son GLOBALES — solo hay un dispositivo A.
+#define USUARIO_MAX  8     // IDs 1..USUARIO_MAX en UI; internamente 0..USUARIO_MAX-1
+
+uint8_t usuarioActivo    = 0;    // indice interno 0..7 (UI muestra +1)
+uint8_t usuarioCandidato = 0;    // pagina 4: lo que el usuario esta seleccionando
+
+// Modal de confirmacion al cambiar de usuario con sesion en curso
+enum CambioUserState { CU_IDLE, CU_CONFIRM };
+CambioUserState cambioUser      = CU_IDLE;
+uint32_t        cambioUserSince = 0;
+#define CAMBIO_USER_CONFIRM_MS  5000UL
+
+// Cronometro de la sesion en curso: millis() cuando empezo.
+// Se reinicia con cada NUEVA SESION exitosa y al boot.
+uint32_t sesionStartMs = 0;
+
 // Log circular de sesiones cerradas en NVS del T-Watch.
 //   - sesion actual NO esta en el log (es la que esta en curso).
 //   - log[0] = mas reciente cerrada; log[count-1] = mas antigua.
@@ -113,7 +137,7 @@ Preferences prefs;
 typedef struct __attribute__((packed)) {
     uint32_t num;          // numero de sesion
     uint16_t cohFinales;   // coherencias al cerrar
-    uint16_t reservado;    // alineacion + uso futuro (duracion/timestamp)
+    uint16_t duracionSeg;  // duracion total en segundos (max 18 h)
 } SesionEntry;
 
 SesionEntry sesionLog[HIST_LEN] = {0};
@@ -129,12 +153,21 @@ uint8_t     viewIdx       = 0;      // 0 = actual; 1..count = guardadas (mas rec
 enum SesionBtnState { SBTN_IDLE, SBTN_CONFIRM, SBTN_WAIT_ECHO, SBTN_OK, SBTN_FAIL };
 SesionBtnState sesionBtn      = SBTN_IDLE;
 uint32_t       sesionBtnSince = 0;
+
+// Maquina de estados del boton BORRAR (mas simple: solo IDLE/CONFIRM/DONE)
+enum BorrarBtnState { BBTN_IDLE, BBTN_CONFIRM, BBTN_DONE };
+BorrarBtnState borrarBtn      = BBTN_IDLE;
+uint32_t       borrarBtnSince = 0;
+#define BORRAR_CONFIRM_MS     5000UL
+#define BORRAR_DONE_MS        1500UL
 uint32_t       seqAlPedir     = 0;     // paqueteRx.seq al enviar el reset; OK = seq nuevo + numCoh=0
 uint16_t       cohAlGuardar   = 0;     // snapshot de coherencias para grabar en el log
+uint16_t       duracionAlGuardar = 0;  // snapshot de duracion (segundos) para el log
 
-#define CONFIRM_WINDOW_MS    3000UL
+#define CONFIRM_WINDOW_MS    5000UL    // ventana generosa para el 2o tap
 #define ECHO_TIMEOUT_MS      2000UL
 #define RESULT_DISPLAY_MS    1500UL
+#define TOUCH_DEBOUNCE_MS     150UL    // debounce general (era 200)
 
 // Vibracion (no bloqueante, patron de 3 pulsos)
 bool     vibrando         = false;
@@ -145,6 +178,15 @@ uint32_t vibrateLastPulse = 0;
 // UI
 uint8_t  currentPage     = 0;   // 0=menu, 1=datos, 2=umbral, 3=sesion
 bool     needFullRedraw  = true;
+uint32_t pageEnterMs     = 0;   // millis() al entrar a la pagina, para ignorar taps fantasma
+
+// Bateria (lectura periodica via AXP202)
+uint8_t  batteryPct      = 0;     // 0..100
+bool     batteryCharging = false;
+bool     batteryConn     = false;
+uint32_t batteryLastRead = 0;
+
+#define PAGE_ENTER_LOCKOUT_MS  400UL    // ignorar taps en los primeros 400ms tras cambio
 
 // ════════════════════════════════════════════════════════════════════════════
 //  HARDWARE T-WATCH
@@ -184,9 +226,11 @@ struct Boton {
 Boton btnMenu     = { 5, 5, 60, HEADER_H };
 
 // Pagina 0
-Boton btnP1 = { 20,  60, 200, 45 };
-Boton btnP2 = { 20, 115, 200, 45 };
-Boton btnP3 = { 20, 170, 200, 45 };
+// Pagina 0: 4 botones mas compactos para dar lugar al boton USUARIO
+Boton btnP1 = { 20,  62, 200, 36 };   // DATOS
+Boton btnP2 = { 20, 102, 200, 36 };   // UMBRAL
+Boton btnP3 = { 20, 142, 200, 36 };   // SESION
+Boton btnP4 = { 20, 182, 200, 36 };   // USUARIO
 
 // Pagina 2 — flechas
 Boton btnUp   = {  30, 100,  70, 70 };
@@ -194,13 +238,22 @@ Boton btnDown = { 140, 100,  70, 70 };
 
 // Pagina 3
 //   Layout vertical (pantalla 240x240, header 0-28):
-//     35-55:   etiqueta "Sesion ACTUAL" o "N/M"
-//     65-115:  numero de sesion grande
-//     125-175: zona de navegacion (flechas laterales + coherencias en centro)
-//     180-218: boton NUEVA SESION
-Boton btnPrevSes = {   5, 125, 55, 50 };   // flecha izq (mas reciente)
-Boton btnNextSes = { 180, 125, 55, 50 };   // flecha der (mas antigua)
-Boton btnGuardar = {  20, 185, 200, 38 };  // NUEVA SESION
+//     35-50:  etiqueta "Sesion ACTUAL" o "N/M"
+//     55-100: numero de sesion grande
+//     105-150: zona de navegacion (flechas laterales + coherencias en centro)
+//     165-215: dos botones lado a lado: NUEVA (izq) y BORRAR (der)
+Boton btnPrevSes = {   5, 105, 55, 45 };   // flecha izq (mas reciente)
+Boton btnNextSes = { 180, 105, 55, 45 };   // flecha der (mas antigua)
+Boton btnGuardar = {  10, 165, 110, 50 };  // NUEVA SESION (izq)
+Boton btnBorrar  = { 130, 165, 100, 50 };  // BORRAR (der)
+
+// Pagina 4 — seleccion de usuario
+Boton btnUserDown   = {   5, 105, 55, 50 };   // flecha izq → disminuir
+Boton btnUserUp     = { 180, 105, 55, 50 };   // flecha der → aumentar
+Boton btnUserChange = {  20, 175, 200, 45 };   // CAMBIAR
+// Modal de confirmacion sobre la pagina 4
+Boton btnUserConfYes = {  10, 110, 105, 60 };
+Boton btnUserConfNo  = { 125, 110, 105, 60 };
 
 // ════════════════════════════════════════════════════════════════════════════
 //  ESP-NOW CALLBACKS (ISR-context: minimo trabajo)
@@ -289,6 +342,58 @@ void vibrarTick(uint32_t now) {
 //  DIBUJO COMUN
 // ════════════════════════════════════════════════════════════════════════════
 
+// ─── Forward declarations (definiciones mas abajo en el archivo) ──────
+static inline uint32_t safeElapsed(uint32_t now, uint32_t since);
+void formatSesionTime(uint32_t ms, char *buf, size_t bufLen);
+
+// ─── Bateria ───────────────────────────────────────────────────────────
+//
+//  El AXP202 expone getBattVoltage() (mV) e isChargeing(). Calculamos %
+//  por voltaje porque getBattPercentage() devuelve 127 sin calibrar.
+
+void leerBateria() {
+    if (!watch || !watch->power) return;
+    float mv = watch->power->getBattVoltage();
+    int pct = (int)((mv - 3000.0f) / (4200.0f - 3000.0f) * 100.0f);
+    if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+    batteryPct      = (uint8_t)pct;
+    batteryCharging = watch->power->isChargeing();
+    batteryConn     = watch->power->isBatteryConnect();
+}
+
+// Dibuja icono de pila + porcentaje. Tamaño compacto para header.
+//   x, y son la esquina superior izquierda del icono (icono 28x12).
+//   El porcentaje sale justo a la derecha del icono.
+void drawBatteryWidget(int16_t x, int16_t y) {
+    const int16_t w = 28, h = 12;
+    uint16_t col;
+    if (!batteryConn)        col = COLOR_LABEL;
+    else if (batteryCharging) col = TFT_CYAN;
+    else if (batteryPct >= 60) col = TFT_GREEN;
+    else if (batteryPct >= 30) col = TFT_YELLOW;
+    else                       col = TFT_RED;
+
+    // Limpiar zona (icono + texto a la derecha)
+    tft->fillRect(x, y - 1, w + 38, h + 3, COLOR_PANEL);
+
+    // Marco de la pila
+    tft->drawRect(x, y, w, h, col);
+    // Punta (boton +)
+    tft->fillRect(x + w, y + 3, 2, h - 6, col);
+
+    // Relleno proporcional al %
+    int fillW = (int)((batteryPct * (w - 4)) / 100);
+    if (fillW > 0) tft->fillRect(x + 2, y + 2, fillW, h - 4, col);
+
+    // Porcentaje en texto a la derecha
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%u%%", (unsigned)batteryPct);
+    tft->setTextDatum(ML_DATUM);
+    tft->setTextFont(1);
+    tft->setTextColor(col, COLOR_PANEL);
+    tft->drawString(buf, x + w + 5, y + h/2);
+}
+
 void drawHeader(const char *titulo, bool showMenuBtn) {
     tft->fillRect(0, 0, 240, HEADER_H, COLOR_PANEL);
     tft->drawFastHLine(0, HEADER_H, 240, COLOR_ACCENT);
@@ -324,16 +429,19 @@ void drawPage0Full() {
     tft->fillScreen(COLOR_BG);
     drawHeader("watchcoherenciasz", false);
 
-    // Indicador NeuroSky
-    tft->setTextDatum(MC_DATUM);
+    // Widget bateria (izquierda del header, ya que aqui no hay boton MENU)
+    drawBatteryWidget(5, 8);
+
+    // Indicador NeuroSky (etiqueta fija; valor se redibuja en update)
+    tft->setTextDatum(ML_DATUM);
     tft->setTextFont(2);
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->drawString("NeuroSky:", 120, 45);
+    tft->drawString("NeuroSky:", 10, 45);
 
-    // Botones
+    // Botones (font 2 porque ahora son mas bajitos)
     auto drawBtn = [](Boton b, const char *t, uint16_t col) {
-        tft->fillRoundRect(b.x, b.y, b.w, b.h, 8, col);
-        tft->drawRoundRect(b.x, b.y, b.w, b.h, 8, TFT_WHITE);
+        tft->fillRoundRect(b.x, b.y, b.w, b.h, 6, col);
+        tft->drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
         tft->setTextColor(TFT_WHITE, col);
         tft->setTextDatum(MC_DATUM);
         tft->setTextFont(4);
@@ -343,15 +451,19 @@ void drawPage0Full() {
     drawBtn(btnP1, "1 DATOS",   COLOR_BTN);
     drawBtn(btnP2, "2 UMBRAL",  COLOR_BTN2);
     drawBtn(btnP3, "3 SESION",  COLOR_BTN3);
+
+    // Boton USUARIO con numero actual incluido (se redibuja en update tambien)
+    char buf[16];
+    snprintf(buf, sizeof(buf), "4 USUARIO %u", (unsigned)(usuarioActivo + 1));
+    drawBtn(btnP4, buf, COLOR_ACCENT);
 }
 
 void drawPage0Update(uint32_t now) {
-    // Estado NeuroSky (puede cambiar)
-    tft->fillRect(0, 28, 240, 28, COLOR_BG);
-    tft->setTextDatum(MC_DATUM);
-    tft->setTextFont(2);
-    tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->drawString("NeuroSky:", 80, 45);
+    // Batteria (se redibuja con cualquier cambio)
+    drawBatteryWidget(5, 8);
+
+    // Estado NeuroSky: solo la zona del valor (la etiqueta es fija)
+    tft->fillRect(85, 35, 155, 20, COLOR_BG);
 
     bool linkUp = (lastRxMs != 0) && (now - lastRxMs < LINK_TIMEOUT_MS);
     const char *ns;
@@ -366,8 +478,10 @@ void drawPage0Update(uint32_t now) {
         ns = "DESCONECTADO";
         nc = COLOR_ERR;
     }
+    tft->setTextDatum(ML_DATUM);
+    tft->setTextFont(2);
     tft->setTextColor(nc, COLOR_BG);
-    tft->drawString(ns, 170, 45);
+    tft->drawString(ns, 90, 45);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -378,38 +492,47 @@ void drawPage1Full() {
     tft->fillScreen(COLOR_BG);
     drawHeader("DATOS", true);
 
+    // Etiquetas fijas
     tft->setTextDatum(ML_DATUM);
     tft->setTextFont(2);
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->drawString("Atencion",     20,  60);
-    tft->drawString("Meditacion",   20, 110);
-    tft->drawString("Coherencias",  20, 175);
+    tft->drawString("Atencion",     20,  82);
+    tft->drawString("Meditacion",   20, 122);
+    tft->drawString("Coherencias",  20, 180);
 }
 
 void drawPage1Update(uint32_t now) {
     char buf[12];
 
+    // Cronometro de la sesion (arriba, centrado)
+    tft->fillRect(70, 33, 100, 22, COLOR_BG);
+    formatSesionTime(safeElapsed(now, sesionStartMs), buf, sizeof(buf));
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(4);
+    tft->setTextColor(COLOR_ACCENT, COLOR_BG);
+    tft->drawString(buf, 120, 44);
+
     // Atencion
-    tft->fillRect(140, 45, 90, 30, COLOR_BG);
+    tft->fillRect(140, 65, 90, 30, COLOR_BG);
     snprintf(buf, sizeof(buf), "%u", (unsigned)uiAttention);
     tft->setTextDatum(MR_DATUM);
     tft->setTextFont(6);
     tft->setTextColor(COLOR_VALUE, COLOR_BG);
-    tft->drawString(buf, 230, 60);
+    tft->drawString(buf, 230, 80);
 
     // Meditacion
-    tft->fillRect(140, 95, 90, 30, COLOR_BG);
+    tft->fillRect(140, 105, 90, 30, COLOR_BG);
     snprintf(buf, sizeof(buf), "%u", (unsigned)uiMeditation);
-    tft->drawString(buf, 230, 110);
+    tft->drawString(buf, 230, 120);
 
     // Linea separadora
-    tft->drawFastHLine(15, 150, 210, COLOR_PANEL);
+    tft->drawFastHLine(15, 155, 210, COLOR_PANEL);
 
     // Coherencias
-    tft->fillRect(140, 155, 90, 35, COLOR_BG);
+    tft->fillRect(140, 160, 90, 35, COLOR_BG);
     snprintf(buf, sizeof(buf), "%u", (unsigned)uiNumCoherencias);
     tft->setTextColor(COLOR_ACCENT, COLOR_BG);
-    tft->drawString(buf, 230, 175);
+    tft->drawString(buf, 230, 180);
 
     // Banner "COHERENCIA!" mientras vibra
     tft->fillRect(0, 200, 240, 28, COLOR_BG);
@@ -483,11 +606,11 @@ void drawSesionButton() {
     const char *label;
     uint16_t    col;
     switch (sesionBtn) {
-        case SBTN_CONFIRM:   label = "CONFIRMAR?";  col = COLOR_ACCENT; break;
-        case SBTN_WAIT_ECHO: label = "esperando..."; col = COLOR_BTN2;  break;
-        case SBTN_OK:        label = "OK";           col = COLOR_OK;     break;
-        case SBTN_FAIL:      label = "FALLO";        col = COLOR_ERR;    break;
-        default:             label = "NUEVA SESION"; col = COLOR_BTN;    break;
+        case SBTN_CONFIRM:   label = "OK?";       col = COLOR_ACCENT; break;
+        case SBTN_WAIT_ECHO: label = "esperando"; col = COLOR_BTN2;   break;
+        case SBTN_OK:        label = "OK";        col = COLOR_OK;     break;
+        case SBTN_FAIL:      label = "FALLO";     col = COLOR_ERR;    break;
+        default:             label = "NUEVA";     col = COLOR_BTN;    break;
     }
     tft->fillRoundRect(btnGuardar.x, btnGuardar.y, btnGuardar.w, btnGuardar.h, 8, col);
     tft->drawRoundRect(btnGuardar.x, btnGuardar.y, btnGuardar.w, btnGuardar.h, 8, TFT_WHITE);
@@ -496,6 +619,23 @@ void drawSesionButton() {
     tft->setTextColor(sesionBtn == SBTN_CONFIRM ? TFT_BLACK : TFT_WHITE, col);
     tft->drawString(label, btnGuardar.x + btnGuardar.w/2,
                     btnGuardar.y + btnGuardar.h/2);
+}
+
+void drawBorrarButton() {
+    const char *label;
+    uint16_t    col;
+    switch (borrarBtn) {
+        case BBTN_CONFIRM: label = "BORRAR?";  col = COLOR_ACCENT; break;
+        case BBTN_DONE:    label = "BORRADO";  col = COLOR_OK;     break;
+        default:           label = "BORRAR";   col = COLOR_ERR;    break;
+    }
+    tft->fillRoundRect(btnBorrar.x, btnBorrar.y, btnBorrar.w, btnBorrar.h, 8, col);
+    tft->drawRoundRect(btnBorrar.x, btnBorrar.y, btnBorrar.w, btnBorrar.h, 8, TFT_WHITE);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(borrarBtn == BBTN_CONFIRM ? TFT_BLACK : TFT_WHITE, col);
+    tft->drawString(label, btnBorrar.x + btnBorrar.w/2,
+                    btnBorrar.y + btnBorrar.h/2);
 }
 
 void drawArrowSes(const Boton &b, bool left, bool habilitado) {
@@ -521,9 +661,10 @@ void drawPage3Full() {
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(2);
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->drawString("Coherencias", 120, 132);
+    tft->drawString("Coherencias", 120, 115);
 
     drawSesionButton();
+    drawBorrarButton();
 }
 
 void drawPage3Update() {
@@ -532,92 +673,297 @@ void drawPage3Update() {
     // Determinar que sesion mostrar y si es "actual" o de log
     uint32_t mostrarNum;
     uint16_t mostrarCoh;
+    uint32_t mostrarMs;        // duracion en ms (actual) o en seg*1000 (log)
     bool     esActual = (viewIdx == 0);
     if (esActual) {
         mostrarNum = sesionActual;
         mostrarCoh = uiNumCoherencias;
+        mostrarMs  = safeElapsed(millis(), sesionStartMs);
     } else {
         uint8_t idx = viewIdx - 1;
         if (idx >= sesionCount) idx = 0;
         mostrarNum = sesionLog[idx].num;
         mostrarCoh = sesionLog[idx].cohFinales;
+        mostrarMs  = (uint32_t)sesionLog[idx].duracionSeg * 1000UL;
     }
 
-    // Etiqueta "Sesion N de M" (cabecera de la vista de log)
-    tft->fillRect(0, 35, 240, 22, COLOR_BG);
+    // Etiqueta "Sesion N/M" + duracion (cabecera de la vista de log)
+    tft->fillRect(0, 32, 240, 18, COLOR_BG);
+    char timeBuf[12];
+    formatSesionTime(mostrarMs, timeBuf, sizeof(timeBuf));
     if (esActual) {
-        snprintf(buf, sizeof(buf), "Sesion ACTUAL");
+        snprintf(buf, sizeof(buf), "ACTUAL  %s", timeBuf);
     } else {
-        snprintf(buf, sizeof(buf), "Sesion %u/%u",
-                 (unsigned)viewIdx, (unsigned)sesionCount);
+        snprintf(buf, sizeof(buf), "%u/%u  %s",
+                 (unsigned)viewIdx, (unsigned)sesionCount, timeBuf);
     }
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(2);
     tft->setTextColor(esActual ? COLOR_ACCENT : COLOR_LABEL, COLOR_BG);
-    tft->drawString(buf, 120, 46);
+    tft->drawString(buf, 120, 42);
 
     // Numero de sesion grande
-    tft->fillRect(50, 65, 140, 50, COLOR_BG);
+    tft->fillRect(50, 55, 140, 50, COLOR_BG);
     snprintf(buf, sizeof(buf), "#%lu", (unsigned long)mostrarNum);
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(6);
     tft->setTextColor(COLOR_VALUE, COLOR_BG);
-    tft->drawString(buf, 120, 90);
+    tft->drawString(buf, 120, 80);
 
     // Flechas (con estado habilitado/deshabilitado)
-    bool puedeIzq = (viewIdx > 0);                          // ir hacia mas reciente (actual)
-    bool puedeDer = (viewIdx < sesionCount);                // ir hacia mas antigua
+    // Izquierda DISMINUYE (va a mas antigua): habilitada si quedan mas antiguas.
+    // Derecha   AUMENTA   (va a mas reciente): habilitada si no estamos en actual.
+    bool puedeIzq = (viewIdx < sesionCount);
+    bool puedeDer = (viewIdx > 0);
     drawArrowSes(btnPrevSes, true,  puedeIzq);
     drawArrowSes(btnNextSes, false, puedeDer);
 
-    // Coherencias (valor grande, color segun fuente). Solo cubre el espacio entre flechas.
-    tft->fillRect(65, 145, 110, 32, COLOR_BG);
+    // Coherencias (valor grande) + tasa cpm (linea pequena debajo).
+    // Zona total entre flechas: y=125-160, ancho 110 (x=65-175).
+    tft->fillRect(65, 125, 110, 35, COLOR_BG);
+
+    // Valor de coherencias
     snprintf(buf, sizeof(buf), "%u", (unsigned)mostrarCoh);
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(4);
     tft->setTextColor(esActual ? COLOR_ACCENT : COLOR_VALUE, COLOR_BG);
-    tft->drawString(buf, 120, 160);
+    tft->drawString(buf, 120, 138);
+
+    // Tasa: coherencias por minuto. Requiere al menos 5s de sesion para
+    // evitar valores absurdos al arrancar (4 coh en 2s → 120 cpm).
+    uint32_t totalSec = mostrarMs / 1000;
+    if (totalSec >= 5) {
+        float cpm = (float)mostrarCoh * 60.0f / (float)totalSec;
+        snprintf(buf, sizeof(buf), "%.2f/min", cpm);
+    } else {
+        snprintf(buf, sizeof(buf), "-- /min");
+    }
+    tft->setTextFont(1);
+    tft->setTextColor(COLOR_LABEL, COLOR_BG);
+    tft->drawString(buf, 120, 156);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PAGINA 4 — SELECCION DE USUARIO
+// ════════════════════════════════════════════════════════════════════════════
+
+void drawPage4Full() {
+    tft->fillScreen(COLOR_BG);
+    drawHeader("USUARIO", true);
+
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(COLOR_LABEL, COLOR_BG);
+    tft->drawString("Selecciona usuario", 120, 50);
+}
+
+void drawPage4Update() {
+    char buf[16];
+
+    // Numero grande del candidato
+    tft->fillRect(50, 70, 140, 60, COLOR_BG);
+    snprintf(buf, sizeof(buf), "%u", (unsigned)(usuarioCandidato + 1));
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(7);
+    bool esActivo = (usuarioCandidato == usuarioActivo);
+    tft->setTextColor(esActivo ? COLOR_OK : COLOR_VALUE, COLOR_BG);
+    tft->drawString(buf, 120, 100);
+
+    // Sub-texto "activo" si coincide
+    tft->fillRect(40, 138, 160, 18, COLOR_BG);
+    if (esActivo) {
+        tft->setTextFont(2);
+        tft->setTextColor(COLOR_OK, COLOR_BG);
+        tft->drawString("activo", 120, 148);
+    }
+
+    // Flechas
+    bool puedeDown = (usuarioCandidato > 0);
+    bool puedeUp   = (usuarioCandidato < USUARIO_MAX - 1);
+    drawArrowSes(btnUserDown, true,  puedeDown);
+    drawArrowSes(btnUserUp,   false, puedeUp);
+
+    // Boton CAMBIAR (deshabilitado si ya es el activo)
+    uint16_t btnCol = esActivo ? COLOR_PANEL : COLOR_BTN;
+    tft->fillRoundRect(btnUserChange.x, btnUserChange.y,
+                       btnUserChange.w, btnUserChange.h, 8, btnCol);
+    tft->drawRoundRect(btnUserChange.x, btnUserChange.y,
+                       btnUserChange.w, btnUserChange.h, 8,
+                       esActivo ? COLOR_LABEL : TFT_WHITE);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(4);
+    tft->setTextColor(esActivo ? COLOR_LABEL : TFT_WHITE, btnCol);
+    tft->drawString("CAMBIAR",
+                    btnUserChange.x + btnUserChange.w / 2,
+                    btnUserChange.y + btnUserChange.h / 2);
+}
+
+// Modal de confirmacion: se dibuja encima de la pagina 4 cuando se intenta
+// cambiar mientras hay coherencias acumuladas (sesion en curso).
+void drawCambioUserModal() {
+    // Panel
+    tft->fillRect(0, 60, 240, 180, COLOR_BG);
+    tft->drawRect(5, 65, 230, 170, COLOR_ACCENT);
+
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(COLOR_ACCENT, COLOR_BG);
+    tft->drawString("Hay sesion en curso", 120, 80);
+    tft->setTextColor(COLOR_LABEL, COLOR_BG);
+    tft->drawString("Cambiar de usuario", 120, 98);
+
+    // Botones SI / NO
+    tft->fillRoundRect(btnUserConfYes.x, btnUserConfYes.y,
+                       btnUserConfYes.w, btnUserConfYes.h, 8, COLOR_ERR);
+    tft->drawRoundRect(btnUserConfYes.x, btnUserConfYes.y,
+                       btnUserConfYes.w, btnUserConfYes.h, 8, TFT_WHITE);
+    tft->setTextColor(TFT_WHITE, COLOR_ERR);
+    tft->setTextFont(4);
+    tft->drawString("DESCARTAR",
+                    btnUserConfYes.x + btnUserConfYes.w / 2,
+                    btnUserConfYes.y + btnUserConfYes.h / 2);
+
+    tft->fillRoundRect(btnUserConfNo.x, btnUserConfNo.y,
+                       btnUserConfNo.w, btnUserConfNo.h, 8, COLOR_BTN2);
+    tft->drawRoundRect(btnUserConfNo.x, btnUserConfNo.y,
+                       btnUserConfNo.w, btnUserConfNo.h, 8, TFT_WHITE);
+    tft->setTextColor(TFT_WHITE, COLOR_BTN2);
+    tft->drawString("CANCELAR",
+                    btnUserConfNo.x + btnUserConfNo.w / 2,
+                    btnUserConfNo.y + btnUserConfNo.h / 2);
+
+    tft->setTextFont(1);
+    tft->setTextColor(COLOR_LABEL, COLOR_BG);
+    tft->drawString("DESCARTAR borra la sesion en curso", 120, 215);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 //  TRANSICIONES
 // ════════════════════════════════════════════════════════════════════════════
 
-// ─── Log de sesiones (NVS) ──────────────────────────────────────────────
+// ─── Cronometro de sesion ──────────────────────────────────────────────
 
-void cargarLogSesiones() {
-    sesionCount  = (uint8_t) prefs.getUChar("scnt", 0);
+// Formatea ms transcurridos en "MM:SS" (hasta 99:59) o "HH:MM:SS" si supera.
+// buf debe ser >= 10 chars.
+void formatSesionTime(uint32_t ms, char *buf, size_t bufLen) {
+    uint32_t totalSec = ms / 1000;
+    uint32_t mm = totalSec / 60;
+    uint32_t ss = totalSec % 60;
+    if (mm < 100) {
+        snprintf(buf, bufLen, "%02lu:%02lu", (unsigned long)mm, (unsigned long)ss);
+    } else {
+        uint32_t hh = mm / 60;
+        mm = mm % 60;
+        snprintf(buf, bufLen, "%lu:%02lu:%02lu",
+                 (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
+    }
+}
+
+// ─── Log de sesiones (NVS) — claves por usuario ─────────────────────────
+
+// Genera "<base><u>" en buf (ej "slog3"). buf debe ser >= 8 chars.
+static void makeKey(char *buf, const char *base, uint8_t u) {
+    snprintf(buf, 8, "%s%u", base, (unsigned)u);
+}
+
+// Carga log + proxima sesion + umbral del usuario u en variables globales.
+void cargarDatosUsuario(uint8_t u) {
+    char k[8];
+
+    makeKey(k, "scnt", u);
+    sesionCount = (uint8_t) prefs.getUChar(k, 0);
     if (sesionCount > HIST_LEN) sesionCount = 0;
-    sesionActual = prefs.getUInt("snext", 1);
+
+    makeKey(k, "snext", u);
+    sesionActual = prefs.getUInt(k, 1);
+
     if (sesionCount > 0) {
+        makeKey(k, "slog", u);
         size_t expected = sizeof(SesionEntry) * sesionCount;
-        size_t got = prefs.getBytes("slog", sesionLog, expected);
+        size_t got = prefs.getBytes(k, sesionLog, expected);
         if (got != expected) {
             sesionCount = 0;   // corrupcion → empezar limpio
         }
     }
-    Serial.printf("[NVS] log: %u sesiones, proxima=#%lu\n",
-                  (unsigned)sesionCount, (unsigned long)sesionActual);
+
+    makeKey(k, "umbr", u);
+    umbralLocal = (uint8_t) prefs.getUChar(k, 60);
+    if (umbralLocal < 40 || umbralLocal > 99) umbralLocal = 60;
+
+    Serial.printf("[NVS] usuario %u cargado: %u sesiones, proxima=#%lu, umbral=%u\n",
+                  (unsigned)(u + 1), (unsigned)sesionCount,
+                  (unsigned long)sesionActual, (unsigned)umbralLocal);
 }
 
 void guardarLogSesiones() {
-    prefs.putUChar("scnt", sesionCount);
-    prefs.putUInt ("snext", sesionActual);
+    char k[8];
+    makeKey(k, "scnt", usuarioActivo);
+    prefs.putUChar(k, sesionCount);
+    makeKey(k, "snext", usuarioActivo);
+    prefs.putUInt(k, sesionActual);
     if (sesionCount > 0) {
-        prefs.putBytes("slog", sesionLog, sizeof(SesionEntry) * sesionCount);
+        makeKey(k, "slog", usuarioActivo);
+        prefs.putBytes(k, sesionLog, sizeof(SesionEntry) * sesionCount);
     }
 }
 
+void guardarUmbralUsuario() {
+    char k[8];
+    makeKey(k, "umbr", usuarioActivo);
+    prefs.putUChar(k, umbralLocal);
+}
+
+// Borra TODAS las sesiones guardadas del usuario activo y reinicia la
+// numeracion a #1. No toca al dispositivo A ni a otros usuarios.
+void borrarHistorialUsuario() {
+    char k[8];
+
+    sesionCount  = 0;
+    sesionActual = 1;
+    memset(sesionLog, 0, sizeof(sesionLog));
+
+    makeKey(k, "scnt", usuarioActivo);
+    prefs.putUChar(k, 0);
+    makeKey(k, "snext", usuarioActivo);
+    prefs.putUInt(k, 1);
+    makeKey(k, "slog", usuarioActivo);
+    prefs.remove(k);   // libera bytes en NVS
+
+    viewIdx = 0;       // volver a vista actual al borrar
+    Serial.printf("[NVS] historial usuario %u borrado\n",
+                  (unsigned)(usuarioActivo + 1));
+}
+
+// Cambia el usuario activo SIN guardar la sesion en curso.
+// Carga su log, su proxima sesion y su umbral. Reinicia el cronometro y
+// envia el nuevo umbral a A para que recalcule coherencias con el umbral
+// del usuario nuevo. Tambien resetea el contador en A.
+void cambiarAUsuario(uint8_t nuevo) {
+    if (nuevo >= USUARIO_MAX) return;
+    if (nuevo == usuarioActivo) return;
+
+    usuarioActivo = nuevo;
+    prefs.putUChar("uact", usuarioActivo);
+    cargarDatosUsuario(usuarioActivo);
+
+    // Reiniciar cronometro y resetear contador en A
+    sesionStartMs = millis();
+    enviarResetAB();
+    enviarUmbralAB();   // notifica el umbral del usuario nuevo a A
+
+    Serial.printf("[USR] cambiado a usuario %u\n", (unsigned)(usuarioActivo + 1));
+}
+
 // Anade una entrada al frente del log (mas reciente), desplazando las demas.
-void anadirSesionAlLog(uint32_t num, uint16_t coh) {
+void anadirSesionAlLog(uint32_t num, uint16_t coh, uint16_t duracionSeg) {
     uint8_t copyLen = sesionCount;
     if (copyLen >= HIST_LEN) copyLen = HIST_LEN - 1;   // descarta la mas antigua
     for (int8_t i = copyLen; i > 0; i--) {
         sesionLog[i] = sesionLog[i - 1];
     }
-    sesionLog[0].num        = num;
-    sesionLog[0].cohFinales = coh;
-    sesionLog[0].reservado  = 0;
+    sesionLog[0].num         = num;
+    sesionLog[0].cohFinales  = coh;
+    sesionLog[0].duracionSeg = duracionSeg;
     if (sesionCount < HIST_LEN) sesionCount++;
     guardarLogSesiones();
 }
@@ -625,17 +971,28 @@ void anadirSesionAlLog(uint32_t num, uint16_t coh) {
 void setPage(uint8_t newPage) {
     currentPage    = newPage;
     needFullRedraw = true;
-    // Salir de pagina 3 → cancelar confirmacion + volver a vista "actual"
+    pageEnterMs    = millis();
+    // Salir de pagina 3 → cancelar confirmaciones + volver a vista "actual"
     if (newPage != 3) {
         sesionBtn = SBTN_IDLE;
+        borrarBtn = BBTN_IDLE;
         viewIdx   = 0;
+    }
+    // Entrar a pagina 4 → candidato = usuario activo. Salir → cancelar modal.
+    if (newPage == 4) {
+        usuarioCandidato = usuarioActivo;
+        cambioUser       = CU_IDLE;
+    } else {
+        cambioUser = CU_IDLE;
     }
 }
 
 void confirmarNuevaSesion() {
-    // Snapshot del contador actual: lo guardaremos en el log SOLO si A confirma el reset.
-    cohAlGuardar = uiNumCoherencias;
-    seqAlPedir   = paqueteRx.seq;
+    // Snapshot del contador y duracion actual: se grabaran SOLO si A confirma.
+    cohAlGuardar      = uiNumCoherencias;
+    uint32_t elapsedSec = safeElapsed(millis(), sesionStartMs) / 1000;
+    duracionAlGuardar = (elapsedSec > UINT16_MAX) ? UINT16_MAX : (uint16_t)elapsedSec;
+    seqAlPedir        = paqueteRx.seq;
 
     // Pedir reset a A via B (todavia no incrementamos sesionActual ni grabamos
     // en NVS: si A no responde queremos quedarnos en la sesion actual).
@@ -663,10 +1020,16 @@ void onSesionTap() {
     }
 }
 
+// Diferencia segura: si `since` es posterior a `now` (clock skew dentro del
+// mismo loop), devuelve 0 en lugar de un underflow uint32_t.
+static inline uint32_t safeElapsed(uint32_t now, uint32_t since) {
+    return (now >= since) ? (now - since) : 0;
+}
+
 void tickSesionBtn(uint32_t now) {
     switch (sesionBtn) {
         case SBTN_CONFIRM:
-            if (now - sesionBtnSince >= CONFIRM_WINDOW_MS) {
+            if (safeElapsed(now, sesionBtnSince) >= CONFIRM_WINDOW_MS) {
                 sesionBtn = SBTN_IDLE;
                 drawSesionButton();
             }
@@ -676,18 +1039,21 @@ void tickSesionBtn(uint32_t now) {
             if (paqueteRx.seq > seqAlPedir && uiNumCoherencias == 0) {
                 // Confirmado por A → recien ahora persistimos la sesion cerrada
                 // y avanzamos el contador. Si timeout-eamos no se toca nada.
-                anadirSesionAlLog(sesionActual, cohAlGuardar);
+                anadirSesionAlLog(sesionActual, cohAlGuardar, duracionAlGuardar);
                 sesionActual++;
                 guardarLogSesiones();
-                Serial.printf("[NVS] sesion #%lu cerrada con %u coherencias; proxima=#%lu\n",
+                Serial.printf("[NVS] sesion #%lu cerrada: %u coh, %u s; proxima=#%lu\n",
                               (unsigned long)(sesionActual - 1),
                               (unsigned)cohAlGuardar,
+                              (unsigned)duracionAlGuardar,
                               (unsigned long)sesionActual);
+                // Reiniciar cronometro de la sesion nueva
+                sesionStartMs  = now;
                 needFullRedraw = true;   // refresca pagina entera (numeros nuevos)
                 sesionBtn      = SBTN_OK;
                 sesionBtnSince = now;
                 drawSesionButton();
-            } else if (now - sesionBtnSince >= ECHO_TIMEOUT_MS) {
+            } else if (safeElapsed(now, sesionBtnSince) >= ECHO_TIMEOUT_MS) {
                 sesionBtn      = SBTN_FAIL;
                 sesionBtnSince = now;
                 drawSesionButton();
@@ -695,9 +1061,49 @@ void tickSesionBtn(uint32_t now) {
             break;
         case SBTN_OK:
         case SBTN_FAIL:
-            if (now - sesionBtnSince >= RESULT_DISPLAY_MS) {
+            if (safeElapsed(now, sesionBtnSince) >= RESULT_DISPLAY_MS) {
                 sesionBtn = SBTN_IDLE;
                 drawSesionButton();
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+// Doble-tap del boton BORRAR del historial del usuario actual.
+void onBorrarTap() {
+    uint32_t now = millis();
+    switch (borrarBtn) {
+        case BBTN_IDLE:
+            borrarBtn      = BBTN_CONFIRM;
+            borrarBtnSince = now;
+            drawBorrarButton();
+            break;
+        case BBTN_CONFIRM:
+            borrarHistorialUsuario();
+            borrarBtn      = BBTN_DONE;
+            borrarBtnSince = now;
+            needFullRedraw = true;   // los numeros volvieron a 0
+            drawBorrarButton();
+            break;
+        default:
+            break;
+    }
+}
+
+void tickBorrarBtn(uint32_t now) {
+    switch (borrarBtn) {
+        case BBTN_CONFIRM:
+            if (safeElapsed(now, borrarBtnSince) >= BORRAR_CONFIRM_MS) {
+                borrarBtn = BBTN_IDLE;
+                drawBorrarButton();
+            }
+            break;
+        case BBTN_DONE:
+            if (safeElapsed(now, borrarBtnSince) >= BORRAR_DONE_MS) {
+                borrarBtn = BBTN_IDLE;
+                drawBorrarButton();
             }
             break;
         default:
@@ -763,13 +1169,20 @@ void setup() {
         watch->drv->setMode(DRV2605_MODE_INTTRIG);
     }
 
-    // NVS
+    // NVS: cargar usuario activo y sus datos (log + proxima sesion + umbral).
     prefs.begin("watchcoh", false);
-    cargarLogSesiones();
-    umbralLocal  = (uint8_t)prefs.getUChar("umbr", 60);
-    if (umbralLocal < 40 || umbralLocal > 99) umbralLocal = 60;
+    usuarioActivo = prefs.getUChar("uact", 0);
+    if (usuarioActivo >= USUARIO_MAX) usuarioActivo = 0;
+    cargarDatosUsuario(usuarioActivo);
 
     espnowInit();
+
+    // Lectura inicial de bateria
+    leerBateria();
+    batteryLastRead = millis();
+
+    // Cronometro: la "sesion en curso" arranca con el boot
+    sesionStartMs = millis();
 
     // Splash 1s
     tft->setTextDatum(MC_DATUM);
@@ -789,6 +1202,13 @@ void setup() {
 // ════════════════════════════════════════════════════════════════════════════
 
 void handleTouch(int16_t tx, int16_t ty) {
+    // Lockout tras cambio de pagina: evita que un mismo toque "atraviese"
+    // el cambio de UI y dispare dos acciones (ej. P0 boton SESION en
+    // y=170-215 solapa con P3 NUEVA SESION en y=185-223).
+    if (millis() - pageEnterMs < PAGE_ENTER_LOCKOUT_MS) {
+        return;
+    }
+
     // MENU global (paginas 1, 2, 3)
     if (currentPage != 0 && btnMenu.dentro(tx, ty)) {
         setPage(0);
@@ -800,6 +1220,7 @@ void handleTouch(int16_t tx, int16_t ty) {
             if      (btnP1.dentro(tx, ty)) setPage(1);
             else if (btnP2.dentro(tx, ty)) setPage(2);
             else if (btnP3.dentro(tx, ty)) setPage(3);
+            else if (btnP4.dentro(tx, ty)) setPage(4);
             break;
 
         case 2:
@@ -823,17 +1244,61 @@ void handleTouch(int16_t tx, int16_t ty) {
         case 3:
             if (btnGuardar.dentro(tx, ty)) {
                 onSesionTap();
+            } else if (btnBorrar.dentro(tx, ty)) {
+                onBorrarTap();
             } else if (btnPrevSes.dentro(tx, ty)) {
-                // Flecha izq → vista mas reciente (idx menor; 0 = actual)
+                // Flecha izq → DISMINUIR: ir a sesion mas antigua (idx mayor)
+                if (viewIdx < sesionCount) {
+                    viewIdx++;
+                    drawPage3Update();
+                }
+            } else if (btnNextSes.dentro(tx, ty)) {
+                // Flecha der → AUMENTAR: ir a sesion mas reciente (idx menor;
+                //              0 = actual)
                 if (viewIdx > 0) {
                     viewIdx--;
                     drawPage3Update();
                 }
-            } else if (btnNextSes.dentro(tx, ty)) {
-                // Flecha der → vista mas antigua (idx mayor, hasta sesionCount)
-                if (viewIdx < sesionCount) {
-                    viewIdx++;
-                    drawPage3Update();
+            }
+            break;
+
+        case 4:
+            if (cambioUser == CU_CONFIRM) {
+                // Modal activo: solo SI / NO responden
+                if (btnUserConfYes.dentro(tx, ty)) {
+                    // DESCARTAR: aplicar el cambio
+                    cambiarAUsuario(usuarioCandidato);
+                    cambioUser     = CU_IDLE;
+                    needFullRedraw = true;
+                } else if (btnUserConfNo.dentro(tx, ty)) {
+                    cambioUser     = CU_IDLE;
+                    needFullRedraw = true;
+                }
+            } else {
+                // Modo normal
+                if (btnUserDown.dentro(tx, ty)) {
+                    if (usuarioCandidato > 0) {
+                        usuarioCandidato--;
+                        drawPage4Update();
+                    }
+                } else if (btnUserUp.dentro(tx, ty)) {
+                    if (usuarioCandidato < USUARIO_MAX - 1) {
+                        usuarioCandidato++;
+                        drawPage4Update();
+                    }
+                } else if (btnUserChange.dentro(tx, ty)) {
+                    if (usuarioCandidato == usuarioActivo) {
+                        // No hacer nada: ya es el activo
+                    } else if (uiNumCoherencias > 0) {
+                        // Sesion en curso → pedir confirmacion
+                        cambioUser      = CU_CONFIRM;
+                        cambioUserSince = millis();
+                        drawCambioUserModal();
+                    } else {
+                        // Sin sesion → cambiar directo
+                        cambiarAUsuario(usuarioCandidato);
+                        needFullRedraw = true;
+                    }
                 }
             }
             break;
@@ -866,11 +1331,17 @@ void loop() {
     // 2. Vibracion tick
     vibrarTick(now);
 
+    // 2b. Lectura periodica de bateria (no bloqueante)
+    if (now - batteryLastRead >= BATTERY_POLL_MS) {
+        batteryLastRead = now;
+        leerBateria();
+    }
+
     // 3. Touch
     int16_t tx, ty;
     static uint32_t lastTouchMs = 0;
     if (watch->getTouch(tx, ty)) {
-        if (now - lastTouchMs > 200) {     // debounce simple
+        if (now - lastTouchMs > TOUCH_DEBOUNCE_MS) {
             lastTouchMs = now;
             handleTouch(tx, ty);
         }
@@ -879,7 +1350,7 @@ void loop() {
     // 4. Debounce TX umbral
     if (umbralLocalDirty && (now - umbralLastChange >= UMBRAL_TX_DEBOUNCE_MS)) {
         enviarUmbralAB();
-        prefs.putUChar("umbr", umbralLocal);
+        guardarUmbralUsuario();
         umbralLocalDirty = false;
     }
 
@@ -892,13 +1363,31 @@ void loop() {
             case 1: drawPage1Full(); break;
             case 2: drawPage2Full(); break;
             case 3: drawPage3Full(); break;
+            case 4:
+                drawPage4Full();
+                if (cambioUser == CU_CONFIRM) drawCambioUserModal();
+                break;
         }
         lastUiUpdate = 0;   // forzar update inmediato
     }
 
-    // 5b. Tick maquina de estados del boton NUEVA SESION (solo pagina 3)
+    // 5b. Tick maquina de estados del boton NUEVA SESION (solo pagina 3).
+    //     IMPORTANTE: refrescar millis() porque handleTouch() pudo asignar
+    //     sesionBtnSince con un valor posterior al `now` capturado al inicio
+    //     del loop. Sin refresco, (now - sesionBtnSince) hace underflow
+    //     uint32_t → 0xFFFFFFFF y el timeout dispara siempre.
     if (currentPage == 3) {
-        tickSesionBtn(now);
+        uint32_t mnow = millis();
+        tickSesionBtn(mnow);
+        tickBorrarBtn(mnow);
+    }
+
+    // 5c. Timeout del modal de cambio de usuario (pagina 4)
+    if (currentPage == 4 && cambioUser == CU_CONFIRM) {
+        if (safeElapsed(millis(), cambioUserSince) >= CAMBIO_USER_CONFIRM_MS) {
+            cambioUser     = CU_IDLE;
+            needFullRedraw = true;
+        }
     }
 
     if (now - lastUiUpdate >= 250) {
@@ -909,6 +1398,10 @@ void loop() {
             case 1: drawPage1Update(now); break;
             case 2: drawPage2Update();    break;
             case 3: drawPage3Update();    break;
+            case 4:
+                // En modal no actualizamos (es estatico hasta que se cierre)
+                if (cambioUser != CU_CONFIRM) drawPage4Update();
+                break;
         }
     }
 
