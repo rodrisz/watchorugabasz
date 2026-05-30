@@ -103,6 +103,21 @@ uint8_t  umbralLocal     = 60;
 bool     umbralLocalDirty= false;
 uint32_t umbralLastChange= 0;
 
+// Minutos objetivo de la sesion (por usuario). Editable en pagina 2.
+// Cuando el cronometro alcanza este valor, se dispara NUEVA SESION automatica.
+#define MINUTOS_MIN  1
+#define MINUTOS_MAX  60
+#define MINUTOS_DEF  15
+uint8_t  minutosObjetivo = MINUTOS_DEF;
+bool     autoCierreDisparado = false;   // evita dispararse multiples veces dentro de la misma sesion
+
+// Gapaxionsz: metodo de meditacion seleccionado (por usuario). Solo
+// metadato: no afecta runtime salvo persistencia.
+#define GPXS_MIN  1
+#define GPXS_MAX  99
+#define GPXS_DEF  1
+uint8_t  gapaxionsz = GPXS_DEF;
+
 // Sesion (pagina 3)
 Preferences prefs;
 
@@ -138,6 +153,9 @@ typedef struct __attribute__((packed)) {
     uint32_t num;          // numero de sesion
     uint16_t cohFinales;   // coherencias al cerrar
     uint16_t duracionSeg;  // duracion total en segundos (max 18 h)
+    uint8_t  umbralUsado;  // umbral activo al cerrar (40-99, 0 = sin dato)
+    uint8_t  objetivoMin;  // minutos objetivo de la sesion (1-60, 0 = sin dato)
+    uint8_t  gpxsUsado;    // metodo Gapaxionsz (1-99, 0 = sin dato)
 } SesionEntry;
 
 SesionEntry sesionLog[HIST_LEN] = {0};
@@ -161,8 +179,10 @@ uint32_t       borrarBtnSince = 0;
 #define BORRAR_CONFIRM_MS     5000UL
 #define BORRAR_DONE_MS        1500UL
 uint32_t       seqAlPedir     = 0;     // paqueteRx.seq al enviar el reset; OK = seq nuevo + numCoh=0
-uint16_t       cohAlGuardar   = 0;     // snapshot de coherencias para grabar en el log
+uint16_t       cohAlGuardar      = 0;  // snapshot de coherencias para grabar en el log
 uint16_t       duracionAlGuardar = 0;  // snapshot de duracion (segundos) para el log
+uint8_t        umbralAlGuardar   = 60; // snapshot del umbral activo al cerrar
+uint8_t        gpxsAlGuardar     = 1;  // snapshot del metodo Gapaxionsz al cerrar
 
 #define CONFIRM_WINDOW_MS    5000UL    // ventana generosa para el 2o tap
 #define ECHO_TIMEOUT_MS      2000UL
@@ -232,9 +252,25 @@ Boton btnP2 = { 20, 102, 200, 36 };   // UMBRAL
 Boton btnP3 = { 20, 142, 200, 36 };   // SESION
 Boton btnP4 = { 20, 182, 200, 36 };   // USUARIO
 
-// Pagina 2 — flechas
-Boton btnUp   = {  30, 100,  70, 70 };
-Boton btnDown = { 140, 100,  70, 70 };
+// Pagina 2 — filas horizontales tipo "selector".
+//   3 filas de ~55 px de alto. Flecha izq (◀) disminuye, der (▶) aumenta.
+//   Etiqueta arriba pequena, valor grande en el centro.
+//
+//   ┌── Fila 1 Umbral   y=40..95   ──┐ yCenter=68
+//   │ ◀         60          ▶       │
+//   └────────────────────────────────┘
+//   ┌── Fila 2 Minutos  y=100..155 ──┐ yCenter=128
+//   │ ◀         15 min      ▶       │
+//   └────────────────────────────────┘
+//   ┌── Fila 3 Gpxsz    y=160..215 ──┐ yCenter=188
+//   │ ◀        Gpxsz1       ▶       │
+//   └────────────────────────────────┘
+Boton btnUmbralDown = {   5,  48, 50, 40 };
+Boton btnUmbralUp   = { 185,  48, 50, 40 };
+Boton btnMinDown    = {   5, 108, 50, 40 };
+Boton btnMinUp      = { 185, 108, 50, 40 };
+Boton btnGpxsDown   = {   5, 168, 50, 40 };
+Boton btnGpxsUp     = { 185, 168, 50, 40 };
 
 // Pagina 3
 //   Layout vertical (pantalla 240x240, header 0-28):
@@ -298,21 +334,43 @@ void enviarResetAB() {
 //  VIBRACION (no bloqueante)
 // ════════════════════════════════════════════════════════════════════════════
 
-// Efectos DRV2605 por pulso, intensidad decreciente:
-//   pulso 0 → Strong Buzz 100%   (efecto 14): firme y claro, ~1s
-//   pulso 1 → Strong Click 100%  (efecto 1):  confirmacion clara
-//   pulso 2 → Medium Click 60%   (efecto 23): eco perceptible que cierra
-static const uint8_t VIBRATE_PATTERN[VIBRATE_PULSES_TOTAL] = { 14, 1, 23 };
+// Dos patrones nombrados, con caracter haptico diferente:
+//
+//   COHERENCIA → ascendente-decay, 3 pulsos, intervalo 800 ms.
+//      14 Strong Buzz 100%  (firme, ~1s)
+//       1 Strong Click 100% (confirmacion clara)
+//      23 Medium Click 60%  (eco que cierra)
+//      Total ~3 s. Sensacion: "evento de logro".
+//
+//   CIERRE → descendente, 4 pulsos largos espaciados, intervalo 1100 ms.
+//      54 Pulsing Medium 1 100%  (campana sostenida 0.6s)
+//      55 Pulsing Medium 2 60%   (campana mas sutil)
+//      67 Transition Hum 4 40%   (zumbido descendente largo)
+//      70 Transition Ramp Down Long Smooth 1 (100→0%, despedida)
+//      Total ~5 s. Sensacion: "final de practica" — calmo, descendente.
+static const uint8_t VIBRATE_PATTERN_COHERENCIA[] = { 14, 1, 23 };
+static const uint8_t VIBRATE_PATTERN_CIERRE[]     = { 54, 55, 67, 70 };
+
+const uint8_t *currentPattern   = VIBRATE_PATTERN_COHERENCIA;
+uint8_t        currentPulses    = 3;
+uint32_t       currentInterval  = 800UL;
+uint32_t       currentBannerMs  = 3000UL;
 
 static void firePulse(uint8_t idx) {
     if (!watch || !watch->drv) return;
-    watch->drv->setWaveform(0, VIBRATE_PATTERN[idx]);
-    watch->drv->setWaveform(1, 0);   // end of sequence
+    watch->drv->setWaveform(0, currentPattern[idx]);
+    watch->drv->setWaveform(1, 0);
     watch->drv->go();
 }
 
-void vibrarStart() {
+// Inicia un patron de vibracion. Si `pattern` es nullptr, usa COHERENCIA.
+void vibrarStartPattern(const uint8_t *pattern, uint8_t pulses,
+                        uint32_t intervalMs, uint32_t bannerMs) {
     if (!watch || !watch->drv) return;
+    currentPattern   = pattern;
+    currentPulses    = pulses;
+    currentInterval  = intervalMs;
+    currentBannerMs  = bannerMs;
     vibrando          = true;
     vibrateStart      = millis();
     vibrateLastPulse  = vibrateStart;
@@ -320,20 +378,27 @@ void vibrarStart() {
     firePulse(0);
 }
 
+// Atajos nombrados (mantienen API previa para el caso COHERENCIA).
+void vibrarStart() {
+    vibrarStartPattern(VIBRATE_PATTERN_COHERENCIA, 3, 800UL, 3000UL);
+}
+
+void vibrarCierre() {
+    vibrarStartPattern(VIBRATE_PATTERN_CIERRE, 4, 1100UL, 5000UL);
+}
+
 void vibrarTick(uint32_t now) {
     if (!vibrando) return;
 
-    // Disparar pulsos siguientes con la cadencia ergonomica
-    if (vibratePulsesDone < VIBRATE_PULSES_TOTAL &&
-        now - vibrateLastPulse >= VIBRATE_PULSE_INTERVAL_MS) {
+    if (vibratePulsesDone < currentPulses &&
+        now - vibrateLastPulse >= currentInterval) {
         firePulse(vibratePulsesDone);
         vibratePulsesDone++;
         vibrateLastPulse = now;
     }
 
-    // Terminar cuando ya pasaron los 3 pulsos + tiempo del banner
-    if (vibratePulsesDone >= VIBRATE_PULSES_TOTAL &&
-        now - vibrateStart >= VIBRATE_BANNER_MS) {
+    if (vibratePulsesDone >= currentPulses &&
+        now - vibrateStart >= currentBannerMs) {
         vibrando = false;
     }
 }
@@ -427,10 +492,18 @@ void drawLinkStatus(uint32_t now) {
 
 void drawPage0Full() {
     tft->fillScreen(COLOR_BG);
-    drawHeader("watchcoherenciasz", false);
+    drawHeader("", false);   // sin titulo: lo dibujamos manual a la derecha del widget
 
     // Widget bateria (izquierda del header, ya que aqui no hay boton MENU)
     drawBatteryWidget(5, 8);
+
+    // Titulo centrado en la mitad derecha del header, evitando el widget
+    // (que ocupa x=5-65). LINK status ocupa x=180-234.
+    //   Zona disponible: 70..175 → centro en x=122.
+    tft->setTextColor(TFT_WHITE, COLOR_PANEL);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->drawString("Mindcoherenciasz", 127, HEADER_H / 2);
 
     // Indicador NeuroSky (etiqueta fija; valor se redibuja en update)
     tft->setTextDatum(ML_DATUM);
@@ -549,53 +622,81 @@ void drawPage1Update(uint32_t now) {
 //  PAGINA 2 — CALIBRAR UMBRAL
 // ════════════════════════════════════════════════════════════════════════════
 
-void drawArrow(Boton b, bool up, uint16_t col) {
-    tft->fillRoundRect(b.x, b.y, b.w, b.h, 8, col);
-    tft->drawRoundRect(b.x, b.y, b.w, b.h, 8, TFT_WHITE);
-    int cx = b.x + b.w/2;
-    int cy = b.y + b.h/2;
-    if (up) {
-        tft->fillTriangle(cx, cy-18, cx-20, cy+14, cx+20, cy+14, TFT_WHITE);
+// Flecha pequena dentro de un Boton (estilo horizontal: <, >).
+// Reutilizable para cualquier selector de pagina 2 o futuras paginas.
+void drawHArrow(const Boton &b, bool left, uint16_t col) {
+    tft->fillRoundRect(b.x, b.y, b.w, b.h, 6, col);
+    tft->drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
+    int cx = b.x + b.w / 2;
+    int cy = b.y + b.h / 2;
+    if (left) {
+        tft->fillTriangle(cx - 12, cy, cx + 10, cy - 14, cx + 10, cy + 14, TFT_WHITE);
     } else {
-        tft->fillTriangle(cx, cy+18, cx-20, cy-14, cx+20, cy-14, TFT_WHITE);
+        tft->fillTriangle(cx + 12, cy, cx - 10, cy - 14, cx - 10, cy + 14, TFT_WHITE);
     }
+}
+
+// Marco visual (sin botones) para una "fila selector": etiqueta arriba +
+// valor centrado. Las flechas las dibuja el caller con drawHArrow.
+//
+//   yCenter es la Y central de la fila. Cada fila ocupa ~55 px.
+//   Limpia zona central x=58..184, y=(yCenter-26..yCenter+22).
+void drawSelectorRow(int16_t yCenter, const char *label,
+                     const char *valor, uint16_t colorValor) {
+    tft->fillRect(60, yCenter - 26, 124, 48, COLOR_BG);
+
+    // Etiqueta pequena arriba
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(1);
+    tft->setTextColor(COLOR_LABEL, COLOR_BG);
+    tft->drawString(label, 120, yCenter - 18);
+
+    // Valor en font 4 (cabe en 55 px de alto)
+    tft->setTextFont(4);
+    tft->setTextColor(colorValor, COLOR_BG);
+    tft->drawString(valor, 120, yCenter + 6);
 }
 
 void drawPage2Full() {
     tft->fillScreen(COLOR_BG);
-    drawHeader("UMBRAL", true);
+    drawHeader("AJUSTES", true);
 
-    tft->setTextDatum(MC_DATUM);
-    tft->setTextFont(2);
-    tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->drawString("Umbral coherenciasz", 120, 50);
+    // Flechas estaticas de cada fila
+    drawHArrow(btnUmbralDown, true,  COLOR_BTN2);
+    drawHArrow(btnUmbralUp,   false, COLOR_BTN);
+    drawHArrow(btnMinDown,    true,  COLOR_BTN2);
+    drawHArrow(btnMinUp,      false, COLOR_BTN);
+    drawHArrow(btnGpxsDown,   true,  COLOR_BTN2);
+    drawHArrow(btnGpxsUp,     false, COLOR_BTN);
 
-    drawArrow(btnDown, false, COLOR_BTN2);
-    drawArrow(btnUp,   true,  COLOR_BTN);
-
-    tft->setTextDatum(MC_DATUM);
-    tft->setTextFont(1);
-    tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->drawString("activo en A:", 120, 195);
+    // Separadores esteticos entre filas
+    tft->drawFastHLine(20,  98, 200, COLOR_PANEL);
+    tft->drawFastHLine(20, 158, 200, COLOR_PANEL);
 }
 
 void drawPage2Update() {
-    char buf[12];
-    // Valor local grande en el centro
-    tft->fillRect(95, 75, 50, 24, COLOR_BG);
-    snprintf(buf, sizeof(buf), "%u", (unsigned)umbralLocal);
-    tft->setTextDatum(MC_DATUM);
-    tft->setTextFont(6);
-    tft->setTextColor(umbralLocalDirty ? COLOR_ACCENT : COLOR_VALUE, COLOR_BG);
-    tft->drawString(buf, 120, 87);
+    char buf[16];
 
-    // Eco del umbral activo que reporta A
-    tft->fillRect(50, 205, 140, 20, COLOR_BG);
-    snprintf(buf, sizeof(buf), "%u", (unsigned)uiUmbralActivo);
+    // Fila 1 — Umbral (yCenter = 68)
+    snprintf(buf, sizeof(buf), "%u", (unsigned)umbralLocal);
+    drawSelectorRow(68, "Umbral coherenciasz", buf,
+                    umbralLocalDirty ? COLOR_ACCENT : COLOR_VALUE);
+
+    // Fila 2 — Minutos (yCenter = 128)
+    snprintf(buf, sizeof(buf), "%u min", (unsigned)minutosObjetivo);
+    drawSelectorRow(128, "Duracion sesion", buf, COLOR_VALUE);
+
+    // Fila 3 — Gapaxionsz (yCenter = 188)
+    snprintf(buf, sizeof(buf), "Gpxsz%u", (unsigned)gapaxionsz);
+    drawSelectorRow(188, "Metodo meditacion", buf, COLOR_ACCENT);
+
+    // Eco del umbral activo que reporta A — al pie, pequeno
+    tft->fillRect(0, 225, 240, 14, COLOR_BG);
+    snprintf(buf, sizeof(buf), "Activo en A: %u", (unsigned)uiUmbralActivo);
     tft->setTextDatum(MC_DATUM);
-    tft->setTextFont(4);
+    tft->setTextFont(1);
     tft->setTextColor(COLOR_OK, COLOR_BG);
-    tft->drawString(buf, 120, 215);
+    tft->drawString(buf, 120, 232);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -668,34 +769,72 @@ void drawPage3Full() {
 }
 
 void drawPage3Update() {
-    char buf[24];
+    char buf[32];
 
     // Determinar que sesion mostrar y si es "actual" o de log
     uint32_t mostrarNum;
     uint16_t mostrarCoh;
     uint32_t mostrarMs;        // duracion en ms (actual) o en seg*1000 (log)
+    uint8_t  mostrarUmbral;    // 0 = sin dato (log antiguo)
+    uint8_t  mostrarObjetivo;  // 0 = sin dato
     bool     esActual = (viewIdx == 0);
     if (esActual) {
         mostrarNum = sesionActual;
         mostrarCoh = uiNumCoherencias;
         mostrarMs  = safeElapsed(millis(), sesionStartMs);
+        // Umbral en vivo: preferir eco de A si esta en rango, si no el local.
+        mostrarUmbral   = (uiUmbralActivo >= 40 && uiUmbralActivo <= 99)
+                          ? uiUmbralActivo : umbralLocal;
+        mostrarObjetivo = minutosObjetivo;
     } else {
         uint8_t idx = viewIdx - 1;
         if (idx >= sesionCount) idx = 0;
-        mostrarNum = sesionLog[idx].num;
-        mostrarCoh = sesionLog[idx].cohFinales;
-        mostrarMs  = (uint32_t)sesionLog[idx].duracionSeg * 1000UL;
+        mostrarNum      = sesionLog[idx].num;
+        mostrarCoh      = sesionLog[idx].cohFinales;
+        mostrarMs       = (uint32_t)sesionLog[idx].duracionSeg * 1000UL;
+        mostrarUmbral   = sesionLog[idx].umbralUsado;
+        mostrarObjetivo = sesionLog[idx].objetivoMin;
     }
 
-    // Etiqueta "Sesion N/M" + duracion (cabecera de la vista de log)
+    // Cabecera de una linea con tiempo/objetivo + umbral compactos.
+    //   "ACTUAL  12:43/15  U:60"   o   "3/7  18:25/15  U:60"
     tft->fillRect(0, 32, 240, 18, COLOR_BG);
+
     char timeBuf[12];
     formatSesionTime(mostrarMs, timeBuf, sizeof(timeBuf));
-    if (esActual) {
-        snprintf(buf, sizeof(buf), "ACTUAL  %s", timeBuf);
+
+    // Fragmento tiempo (con o sin objetivo)
+    char tBuf[18];
+    if (mostrarObjetivo >= MINUTOS_MIN && mostrarObjetivo <= MINUTOS_MAX) {
+        snprintf(tBuf, sizeof(tBuf), "%s/%u", timeBuf, (unsigned)mostrarObjetivo);
     } else {
-        snprintf(buf, sizeof(buf), "%u/%u  %s",
-                 (unsigned)viewIdx, (unsigned)sesionCount, timeBuf);
+        snprintf(tBuf, sizeof(tBuf), "%s", timeBuf);
+    }
+
+    // Fragmento umbral (corto, "U:60" o "U:--")
+    char uBuf[8];
+    if (mostrarUmbral >= 40 && mostrarUmbral <= 99) {
+        snprintf(uBuf, sizeof(uBuf), "U:%u", (unsigned)mostrarUmbral);
+    } else {
+        snprintf(uBuf, sizeof(uBuf), "U:--");
+    }
+
+    // Fragmento Gapaxionsz ("Gx3" o "Gx--")
+    uint8_t mostrarGpxs = esActual ? gapaxionsz
+                                   : sesionLog[viewIdx - 1 < sesionCount ? viewIdx - 1 : 0].gpxsUsado;
+    char gpxBuf[8];
+    if (mostrarGpxs >= GPXS_MIN && mostrarGpxs <= GPXS_MAX) {
+        snprintf(gpxBuf, sizeof(gpxBuf), "Gx%u", (unsigned)mostrarGpxs);
+    } else {
+        snprintf(gpxBuf, sizeof(gpxBuf), "Gx--");
+    }
+
+    // Linea unificada
+    if (esActual) {
+        snprintf(buf, sizeof(buf), "ACTUAL %s %s %s", tBuf, uBuf, gpxBuf);
+    } else {
+        snprintf(buf, sizeof(buf), "%u/%u %s %s %s",
+                 (unsigned)viewIdx, (unsigned)sesionCount, tBuf, uBuf, gpxBuf);
     }
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(2);
@@ -879,9 +1018,45 @@ void cargarDatosUsuario(uint8_t u) {
 
     if (sesionCount > 0) {
         makeKey(k, "slog", u);
-        size_t expected = sizeof(SesionEntry) * sesionCount;
+        size_t expected = sizeof(SesionEntry) * sesionCount;   // 11 bytes/entry
         size_t got = prefs.getBytes(k, sesionLog, expected);
-        if (got != expected) {
+        if (got == expected) {
+            // formato actual, cargado tal cual.
+        } else if (got == 10u * sesionCount) {
+            // Formato v2 (10 bytes/entry, sin gpxsUsado). Reinterpretar.
+            uint8_t raw[10 * HIST_LEN];
+            prefs.getBytes(k, raw, got);
+            for (int i = sesionCount - 1; i >= 0; i--) {
+                uint8_t *src = raw + (i * 10);
+                sesionLog[i].num         = ((uint32_t)src[0])        |
+                                           ((uint32_t)src[1] << 8)   |
+                                           ((uint32_t)src[2] << 16)  |
+                                           ((uint32_t)src[3] << 24);
+                sesionLog[i].cohFinales  = (uint16_t)src[4] | ((uint16_t)src[5] << 8);
+                sesionLog[i].duracionSeg = (uint16_t)src[6] | ((uint16_t)src[7] << 8);
+                sesionLog[i].umbralUsado = src[8];
+                sesionLog[i].objetivoMin = src[9];
+                sesionLog[i].gpxsUsado   = 0;
+            }
+            Serial.println("[NVS] log migrado v2 -> v3 (gpxs sin dato historico)");
+        } else if (got == 8u * sesionCount) {
+            // Formato v1 (8 bytes/entry, sin umbral/objetivo/gpxs).
+            uint8_t raw[8 * HIST_LEN];
+            prefs.getBytes(k, raw, got);
+            for (int i = sesionCount - 1; i >= 0; i--) {
+                uint8_t *src = raw + (i * 8);
+                sesionLog[i].num         = ((uint32_t)src[0])        |
+                                           ((uint32_t)src[1] << 8)   |
+                                           ((uint32_t)src[2] << 16)  |
+                                           ((uint32_t)src[3] << 24);
+                sesionLog[i].cohFinales  = (uint16_t)src[4] | ((uint16_t)src[5] << 8);
+                sesionLog[i].duracionSeg = (uint16_t)src[6] | ((uint16_t)src[7] << 8);
+                sesionLog[i].umbralUsado = 0;
+                sesionLog[i].objetivoMin = 0;
+                sesionLog[i].gpxsUsado   = 0;
+            }
+            Serial.println("[NVS] log migrado v1 -> v3 (sin umbral/objetivo/gpxs historicos)");
+        } else {
             sesionCount = 0;   // corrupcion → empezar limpio
         }
     }
@@ -890,9 +1065,21 @@ void cargarDatosUsuario(uint8_t u) {
     umbralLocal = (uint8_t) prefs.getUChar(k, 60);
     if (umbralLocal < 40 || umbralLocal > 99) umbralLocal = 60;
 
-    Serial.printf("[NVS] usuario %u cargado: %u sesiones, proxima=#%lu, umbral=%u\n",
+    makeKey(k, "mnts", u);
+    minutosObjetivo = (uint8_t) prefs.getUChar(k, MINUTOS_DEF);
+    if (minutosObjetivo < MINUTOS_MIN || minutosObjetivo > MINUTOS_MAX)
+        minutosObjetivo = MINUTOS_DEF;
+
+    makeKey(k, "gpxs", u);
+    gapaxionsz = (uint8_t) prefs.getUChar(k, GPXS_DEF);
+    if (gapaxionsz < GPXS_MIN || gapaxionsz > GPXS_MAX) gapaxionsz = GPXS_DEF;
+
+    autoCierreDisparado = false;   // reset al cambiar de usuario
+
+    Serial.printf("[NVS] usuario %u cargado: %u sesiones, proxima=#%lu, umbral=%u, objetivo=%u min, gpxs=%u\n",
                   (unsigned)(u + 1), (unsigned)sesionCount,
-                  (unsigned long)sesionActual, (unsigned)umbralLocal);
+                  (unsigned long)sesionActual, (unsigned)umbralLocal,
+                  (unsigned)minutosObjetivo, (unsigned)gapaxionsz);
 }
 
 void guardarLogSesiones() {
@@ -911,6 +1098,18 @@ void guardarUmbralUsuario() {
     char k[8];
     makeKey(k, "umbr", usuarioActivo);
     prefs.putUChar(k, umbralLocal);
+}
+
+void guardarMinutosUsuario() {
+    char k[8];
+    makeKey(k, "mnts", usuarioActivo);
+    prefs.putUChar(k, minutosObjetivo);
+}
+
+void guardarGpxsUsuario() {
+    char k[8];
+    makeKey(k, "gpxs", usuarioActivo);
+    prefs.putUChar(k, gapaxionsz);
 }
 
 // Borra TODAS las sesiones guardadas del usuario activo y reinicia la
@@ -946,8 +1145,9 @@ void cambiarAUsuario(uint8_t nuevo) {
     prefs.putUChar("uact", usuarioActivo);
     cargarDatosUsuario(usuarioActivo);
 
-    // Reiniciar cronometro y resetear contador en A
-    sesionStartMs = millis();
+    // Reiniciar cronometro, rearmar auto-cierre, y resetear contador en A
+    sesionStartMs       = millis();
+    autoCierreDisparado = false;
     enviarResetAB();
     enviarUmbralAB();   // notifica el umbral del usuario nuevo a A
 
@@ -955,7 +1155,8 @@ void cambiarAUsuario(uint8_t nuevo) {
 }
 
 // Anade una entrada al frente del log (mas reciente), desplazando las demas.
-void anadirSesionAlLog(uint32_t num, uint16_t coh, uint16_t duracionSeg) {
+void anadirSesionAlLog(uint32_t num, uint16_t coh, uint16_t duracionSeg,
+                       uint8_t umbral, uint8_t objetivoMin, uint8_t gpxs) {
     uint8_t copyLen = sesionCount;
     if (copyLen >= HIST_LEN) copyLen = HIST_LEN - 1;   // descarta la mas antigua
     for (int8_t i = copyLen; i > 0; i--) {
@@ -964,6 +1165,9 @@ void anadirSesionAlLog(uint32_t num, uint16_t coh, uint16_t duracionSeg) {
     sesionLog[0].num         = num;
     sesionLog[0].cohFinales  = coh;
     sesionLog[0].duracionSeg = duracionSeg;
+    sesionLog[0].umbralUsado = umbral;
+    sesionLog[0].objetivoMin = objetivoMin;
+    sesionLog[0].gpxsUsado   = gpxs;
     if (sesionCount < HIST_LEN) sesionCount++;
     guardarLogSesiones();
 }
@@ -988,10 +1192,15 @@ void setPage(uint8_t newPage) {
 }
 
 void confirmarNuevaSesion() {
-    // Snapshot del contador y duracion actual: se grabaran SOLO si A confirma.
+    // Snapshot del contador, duracion y umbral: se grabaran SOLO si A confirma.
     cohAlGuardar      = uiNumCoherencias;
     uint32_t elapsedSec = safeElapsed(millis(), sesionStartMs) / 1000;
     duracionAlGuardar = (elapsedSec > UINT16_MAX) ? UINT16_MAX : (uint16_t)elapsedSec;
+    // Preferimos el eco real que reporta A (uiUmbralActivo). Si A no ha
+    // reportado aun, caemos al umbralLocal de la UI.
+    umbralAlGuardar   = (uiUmbralActivo >= 40 && uiUmbralActivo <= 99)
+                        ? uiUmbralActivo : umbralLocal;
+    gpxsAlGuardar     = gapaxionsz;
     seqAlPedir        = paqueteRx.seq;
 
     // Pedir reset a A via B (todavia no incrementamos sesionActual ni grabamos
@@ -1039,17 +1248,22 @@ void tickSesionBtn(uint32_t now) {
             if (paqueteRx.seq > seqAlPedir && uiNumCoherencias == 0) {
                 // Confirmado por A → recien ahora persistimos la sesion cerrada
                 // y avanzamos el contador. Si timeout-eamos no se toca nada.
-                anadirSesionAlLog(sesionActual, cohAlGuardar, duracionAlGuardar);
+                anadirSesionAlLog(sesionActual, cohAlGuardar, duracionAlGuardar,
+                                  umbralAlGuardar, minutosObjetivo, gpxsAlGuardar);
                 sesionActual++;
                 guardarLogSesiones();
-                Serial.printf("[NVS] sesion #%lu cerrada: %u coh, %u s; proxima=#%lu\n",
+                Serial.printf("[NVS] sesion #%lu cerrada: %u coh, %u s, umbral %u, objetivo %u min, gpxs %u; proxima=#%lu\n",
                               (unsigned long)(sesionActual - 1),
                               (unsigned)cohAlGuardar,
                               (unsigned)duracionAlGuardar,
+                              (unsigned)umbralAlGuardar,
+                              (unsigned)minutosObjetivo,
+                              (unsigned)gpxsAlGuardar,
                               (unsigned long)sesionActual);
-                // Reiniciar cronometro de la sesion nueva
-                sesionStartMs  = now;
-                needFullRedraw = true;   // refresca pagina entera (numeros nuevos)
+                // Reiniciar cronometro y rearmar auto-cierre para la sesion nueva
+                sesionStartMs       = now;
+                autoCierreDisparado = false;
+                needFullRedraw      = true;   // refresca pagina entera (numeros nuevos)
                 sesionBtn      = SBTN_OK;
                 sesionBtnSince = now;
                 drawSesionButton();
@@ -1224,18 +1438,48 @@ void handleTouch(int16_t tx, int16_t ty) {
             break;
 
         case 2:
-            if (btnUp.dentro(tx, ty)) {
+            // Fila umbral (40..99)
+            if (btnUmbralUp.dentro(tx, ty)) {
                 if (umbralLocal < 99) {
                     umbralLocal++;
                     umbralLocalDirty  = true;
                     umbralLastChange  = millis();
                     drawPage2Update();
                 }
-            } else if (btnDown.dentro(tx, ty)) {
+            } else if (btnUmbralDown.dentro(tx, ty)) {
                 if (umbralLocal > 40) {
                     umbralLocal--;
                     umbralLocalDirty  = true;
                     umbralLastChange  = millis();
+                    drawPage2Update();
+                }
+            }
+            // Fila minutos (1..60)
+            else if (btnMinUp.dentro(tx, ty)) {
+                if (minutosObjetivo < MINUTOS_MAX) {
+                    minutosObjetivo++;
+                    guardarMinutosUsuario();
+                    autoCierreDisparado = false;   // si subio el objetivo, re-armar
+                    drawPage2Update();
+                }
+            } else if (btnMinDown.dentro(tx, ty)) {
+                if (minutosObjetivo > MINUTOS_MIN) {
+                    minutosObjetivo--;
+                    guardarMinutosUsuario();
+                    drawPage2Update();
+                }
+            }
+            // Fila Gapaxionsz (1..99)
+            else if (btnGpxsUp.dentro(tx, ty)) {
+                if (gapaxionsz < GPXS_MAX) {
+                    gapaxionsz++;
+                    guardarGpxsUsuario();
+                    drawPage2Update();
+                }
+            } else if (btnGpxsDown.dentro(tx, ty)) {
+                if (gapaxionsz > GPXS_MIN) {
+                    gapaxionsz--;
+                    guardarGpxsUsuario();
                     drawPage2Update();
                 }
             }
@@ -1335,6 +1579,23 @@ void loop() {
     if (now - batteryLastRead >= BATTERY_POLL_MS) {
         batteryLastRead = now;
         leerBateria();
+    }
+
+    // 2c. Auto-cierre: si el cronometro supera el objetivo y no estamos
+    //     ya en proceso de cerrar, dispara confirmarNuevaSesion() automatico.
+    //     Solo si hay link con B (si no hay link, A no recibe el reset).
+    if (!autoCierreDisparado &&
+        sesionBtn == SBTN_IDLE &&
+        lastRxMs != 0 &&
+        (now - lastRxMs < LINK_TIMEOUT_MS)) {
+        uint32_t elapsedSec = safeElapsed(now, sesionStartMs) / 1000;
+        if (elapsedSec >= (uint32_t)minutosObjetivo * 60UL) {
+            Serial.printf("[AUTO] objetivo %u min alcanzado (%lu s) -> cierre auto\n",
+                          (unsigned)minutosObjetivo, (unsigned long)elapsedSec);
+            autoCierreDisparado = true;
+            vibrarCierre();   // patron haptico descendente, distinto de coherencia
+            confirmarNuevaSesion();
+        }
     }
 
     // 3. Touch
