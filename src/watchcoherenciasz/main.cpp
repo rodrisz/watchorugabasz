@@ -39,6 +39,8 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <Preferences.h>
+#include <FS.h>
+#include <SD.h>
 
 // ════════════════════════════════════════════════════════════════════════════
 //  CONFIG ESP-NOW
@@ -147,7 +149,7 @@ uint32_t sesionStartMs = 0;
 // Log circular de sesiones cerradas en NVS del T-Watch.
 //   - sesion actual NO esta en el log (es la que esta en curso).
 //   - log[0] = mas reciente cerrada; log[count-1] = mas antigua.
-//   - HIST_LEN = 50 entradas × 8 bytes = 400 bytes, holgado para NVS.
+//   - HIST_LEN = 50 entradas × 15 bytes = 750 bytes, holgado para NVS.
 #define HIST_LEN 50
 typedef struct __attribute__((packed)) {
     uint32_t num;          // numero de sesion
@@ -156,6 +158,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  umbralUsado;  // umbral activo al cerrar (40-99, 0 = sin dato)
     uint8_t  objetivoMin;  // minutos objetivo de la sesion (1-60, 0 = sin dato)
     uint8_t  gpxsUsado;    // metodo Gapaxionsz (1-99, 0 = sin dato)
+    uint32_t timestamp;    // Unix epoch al cerrar sesion (0 = sin dato / RTC no ajustado)
 } SesionEntry;
 
 SesionEntry sesionLog[HIST_LEN] = {0};
@@ -291,6 +294,29 @@ Boton btnUserChange = {  20, 175, 200, 45 };   // CAMBIAR
 Boton btnUserConfYes = {  10, 110, 105, 60 };
 Boton btnUserConfNo  = { 125, 110, 105, 60 };
 
+// Pagina 5 — ajuste de hora RTC
+// 3 columnas (x=20,95,170) para AÑO/MES/DIA  y 2 columnas (x=57,147) para HOR/MIN
+// Flechas arriba (y=48) y abajo (y=98) para fecha; arriba (y=133) y abajo (y=175) para hora
+Boton btnYearUp  = {  5, 48, 75, 30 };
+Boton btnMonUp   = { 83, 48, 75, 30 };
+Boton btnDayUp   = {161, 48, 75, 30 };
+Boton btnYearDn  = {  5, 95, 75, 30 };
+Boton btnMonDn   = { 83, 95, 75, 30 };
+Boton btnDayDn   = {161, 95, 75, 30 };
+Boton btnRtcHourUp = { 20,133, 95, 30 };
+Boton btnRtcMinUp  = {125,133, 95, 30 };
+Boton btnRtcHourDn = { 20,175, 95, 30 };
+Boton btnRtcMinDn  = {125,175, 95, 30 };
+Boton btnRtcSave = { 20,210, 200, 26 };
+Boton btnHoraLink = { 148, 5, 55, 22 };   // boton "HORA" en header pagina 4
+
+// Estado edicion RTC (pagina 5)
+uint16_t rtcEditYear  = 2026;
+uint8_t  rtcEditMonth = 1;
+uint8_t  rtcEditDay   = 1;
+uint8_t  rtcEditHour  = 0;
+uint8_t  rtcEditMin   = 0;
+
 // ════════════════════════════════════════════════════════════════════════════
 //  ESP-NOW CALLBACKS (ISR-context: minimo trabajo)
 // ════════════════════════════════════════════════════════════════════════════
@@ -342,14 +368,13 @@ void enviarResetAB() {
 //      23 Medium Click 60%  (eco que cierra)
 //      Total ~3 s. Sensacion: "evento de logro".
 //
-//   CIERRE → descendente, 4 pulsos largos espaciados, intervalo 1100 ms.
-//      54 Pulsing Medium 1 100%  (campana sostenida 0.6s)
-//      55 Pulsing Medium 2 60%   (campana mas sutil)
-//      67 Transition Hum 4 40%   (zumbido descendente largo)
-//      70 Transition Ramp Down Long Smooth 1 (100→0%, despedida)
-//      Total ~5 s. Sensacion: "final de practica" — calmo, descendente.
+//   CIERRE → intermitente, 6 pulsos alternados fuerte/suave, intervalo 700 ms.
+//      14 Strong Buzz 100%   (buzz firme ~1s)
+//       7 Soft Bump 100%     (bump suave, contraste con el buzz)
+//      Alternados x3 pares = 6 disparos total, silencio 700ms entre cada uno.
+//      Total ~5 s. Sensacion: "fin de sesion — atencion, para ya".
 static const uint8_t VIBRATE_PATTERN_COHERENCIA[] = { 14, 1, 23 };
-static const uint8_t VIBRATE_PATTERN_CIERRE[]     = { 54, 55, 67, 70 };
+static const uint8_t VIBRATE_PATTERN_CIERRE[]     = { 14, 7, 14, 7, 14, 7 };
 
 const uint8_t *currentPattern   = VIBRATE_PATTERN_COHERENCIA;
 uint8_t        currentPulses    = 3;
@@ -384,7 +409,7 @@ void vibrarStart() {
 }
 
 void vibrarCierre() {
-    vibrarStartPattern(VIBRATE_PATTERN_CIERRE, 4, 1100UL, 5000UL);
+    vibrarStartPattern(VIBRATE_PATTERN_CIERRE, 6, 700UL, 5000UL);
 }
 
 void vibrarTick(uint32_t now) {
@@ -424,6 +449,32 @@ void leerBateria() {
     batteryPct      = (uint8_t)pct;
     batteryCharging = watch->power->isChargeing();
     batteryConn     = watch->power->isBatteryConnect();
+}
+
+// Formatea epoch como "YYYY-MM-DD HH:MM:SS" en buf (minimo 20 chars).
+static void epochToStr(uint32_t ts, char *buf, size_t len) {
+    if (ts == 0) { snprintf(buf, len, "sin fecha"); return; }
+    uint32_t s   = ts % 60; ts /= 60;
+    uint32_t min = ts % 60; ts /= 60;
+    uint32_t h   = ts % 24; ts /= 24;
+    uint32_t dias = ts;
+    uint16_t y = 1970;
+    while (true) {
+        bool bis = ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
+        if (dias < (uint16_t)(bis ? 366 : 365)) break;
+        dias -= bis ? 366 : 365; y++;
+    }
+    static const uint8_t dimMes[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    bool bis = ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
+    uint8_t m = 1;
+    while (m <= 12) {
+        uint8_t dm = dimMes[m - 1] + (m == 2 && bis ? 1 : 0);
+        if (dias < dm) break;
+        dias -= dm; m++;
+    }
+    snprintf(buf, len, "%04u-%02u-%02u %02u:%02u:%02u",
+             (unsigned)y, (unsigned)m, (unsigned)(dias + 1),
+             (unsigned)h, (unsigned)min, (unsigned)s);
 }
 
 // Dibuja icono de pila + porcentaje. Tamaño compacto para header.
@@ -841,13 +892,24 @@ void drawPage3Update() {
     tft->setTextColor(esActual ? COLOR_ACCENT : COLOR_LABEL, COLOR_BG);
     tft->drawString(buf, 120, 42);
 
-    // Numero de sesion grande
-    tft->fillRect(50, 55, 140, 50, COLOR_BG);
+    // Numero de sesion grande + fecha debajo (si hay timestamp)
+    tft->fillRect(50, 55, 140, 68, COLOR_BG);
     snprintf(buf, sizeof(buf), "#%lu", (unsigned long)mostrarNum);
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(6);
     tft->setTextColor(COLOR_VALUE, COLOR_BG);
-    tft->drawString(buf, 120, 80);
+    tft->drawString(buf, 120, 76);
+
+    // Fecha de cierre (solo sesiones historicas con timestamp valido)
+    uint32_t mostrarTs = esActual ? 0 : sesionLog[viewIdx - 1 < sesionCount ? viewIdx - 1 : 0].timestamp;
+    if (!esActual && mostrarTs > 0) {
+        char dtBuf[20];
+        epochToStr(mostrarTs, dtBuf, sizeof(dtBuf));
+        dtBuf[10] = '\0';  // solo la parte de fecha "YYYY-MM-DD"
+        tft->setTextFont(1);
+        tft->setTextColor(COLOR_LABEL, COLOR_BG);
+        tft->drawString(dtBuf, 120, 106);
+    }
 
     // Flechas (con estado habilitado/deshabilitado)
     // Izquierda DISMINUYE (va a mas antigua): habilitada si quedan mas antiguas.
@@ -890,7 +952,16 @@ void drawPage4Full() {
     tft->fillScreen(COLOR_BG);
     drawHeader("USUARIO", true);
 
+    // Boton HORA en esquina derecha del header (navega a pagina 5)
+    tft->fillRoundRect(btnHoraLink.x, btnHoraLink.y,
+                       btnHoraLink.w, btnHoraLink.h, 4, COLOR_BTN2);
     tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(1);
+    tft->setTextColor(TFT_WHITE, COLOR_BTN2);
+    tft->drawString("HORA",
+                    btnHoraLink.x + btnHoraLink.w / 2,
+                    btnHoraLink.y + btnHoraLink.h / 2);
+
     tft->setTextFont(2);
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
     tft->drawString("Selecciona usuario", 120, 50);
@@ -977,6 +1048,100 @@ void drawCambioUserModal() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  PAGINA 5 — AJUSTE HORA RTC
+// ════════════════════════════════════════════════════════════════════════════
+
+// Dibuja una columna de ajuste: etiqueta arriba, valor en medio, flechas encima/debajo.
+static void drawRtcField(int16_t cx, int16_t yLabel, int16_t yVal,
+                         const Boton &bUp, const Boton &bDn,
+                         const char *label, const char *val) {
+    // Etiqueta
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(1);
+    tft->setTextColor(COLOR_LABEL, COLOR_BG);
+    tft->drawString(label, cx, yLabel);
+    // Flecha arriba
+    tft->fillRoundRect(bUp.x, bUp.y, bUp.w, bUp.h, 5, COLOR_PANEL);
+    tft->setTextFont(2);
+    tft->setTextColor(COLOR_ACCENT, COLOR_PANEL);
+    tft->drawString("+", cx, bUp.y + bUp.h / 2);
+    // Valor
+    tft->fillRect(bUp.x, yVal - 10, bUp.w, 20, COLOR_BG);
+    tft->setTextFont(4);
+    tft->setTextColor(COLOR_VALUE, COLOR_BG);
+    tft->drawString(val, cx, yVal);
+    // Flecha abajo
+    tft->fillRoundRect(bDn.x, bDn.y, bDn.w, bDn.h, 5, COLOR_PANEL);
+    tft->setTextFont(2);
+    tft->setTextColor(COLOR_ACCENT, COLOR_PANEL);
+    tft->drawString("-", cx, bDn.y + bDn.h / 2);
+}
+
+void drawPage5Full() {
+    tft->fillScreen(COLOR_BG);
+    drawHeader("AJUSTE HORA", true);
+
+    // Separador fecha / hora
+    tft->drawFastHLine(10, 122, 220, COLOR_PANEL);
+    tft->setTextDatum(ML_DATUM);
+    tft->setTextFont(1);
+    tft->setTextColor(COLOR_LABEL, COLOR_BG);
+    tft->drawString("FECHA", 12, 118);
+    tft->drawString("HORA", 12, 130);
+}
+
+void drawPage5Update() {
+    char buf[8];
+    // Columnas fecha: cx=42, 120, 198
+    snprintf(buf, sizeof(buf), "%04u", (unsigned)rtcEditYear);
+    drawRtcField(42,  39, 79, btnYearUp, btnYearDn, "ANO",  buf);
+    snprintf(buf, sizeof(buf), "%02u",   (unsigned)rtcEditMonth);
+    drawRtcField(120, 39, 79, btnMonUp,  btnMonDn,  "MES",  buf);
+    snprintf(buf, sizeof(buf), "%02u",   (unsigned)rtcEditDay);
+    drawRtcField(198, 39, 79, btnDayUp,  btnDayDn,  "DIA",  buf);
+    // Columnas hora: cx=67, 172
+    snprintf(buf, sizeof(buf), "%02u",   (unsigned)rtcEditHour);
+    drawRtcField(67,  128, 160, btnRtcHourUp, btnRtcHourDn, "HOR", buf);
+    snprintf(buf, sizeof(buf), "%02u",   (unsigned)rtcEditMin);
+    drawRtcField(172, 128, 160, btnRtcMinUp,  btnRtcMinDn,  "MIN", buf);
+    // Boton GUARDAR
+    tft->fillRoundRect(btnRtcSave.x, btnRtcSave.y,
+                       btnRtcSave.w, btnRtcSave.h, 6, COLOR_BTN);
+    tft->drawRoundRect(btnRtcSave.x, btnRtcSave.y,
+                       btnRtcSave.w, btnRtcSave.h, 6, TFT_WHITE);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(TFT_WHITE, COLOR_BTN);
+    tft->drawString("GUARDAR",
+                    btnRtcSave.x + btnRtcSave.w / 2,
+                    btnRtcSave.y + btnRtcSave.h / 2);
+}
+
+// Carga el RTC actual en las variables de edicion (al entrar a p5).
+static void rtcEditCargar() {
+    if (!watch || !watch->rtc) return;
+    RTC_Date dt = watch->rtc->getDateTime();
+    if (dt.year >= 2020 && dt.year <= 2099) {
+        rtcEditYear  = dt.year;
+        rtcEditMonth = dt.month;
+        rtcEditDay   = dt.day;
+        rtcEditHour  = dt.hour;
+        rtcEditMin   = dt.minute;
+    } else {
+        rtcEditYear  = 2026; rtcEditMonth = 1; rtcEditDay = 1;
+        rtcEditHour  = 0;    rtcEditMin   = 0;
+    }
+}
+
+// Dias validos segun mes/año
+static uint8_t diasEnMes(uint16_t y, uint8_t m) {
+    static const uint8_t dim[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    uint8_t d = dim[m - 1];
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) d = 29;
+    return d;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  TRANSICIONES
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -996,6 +1161,39 @@ void formatSesionTime(uint32_t ms, char *buf, size_t bufLen) {
         snprintf(buf, bufLen, "%lu:%02lu:%02lu",
                  (unsigned long)hh, (unsigned long)mm, (unsigned long)ss);
     }
+}
+
+// ─── RTC helpers ─────────────────────────────────────────────────────────
+
+// Convierte fecha+hora del PCF8563 a Unix epoch (UTC aproximado).
+// Formula de Tomohiko Sakamoto simplificada, valida para años 2000+.
+static uint32_t rtcToEpoch(const RTC_Date &d) {
+    // Dias desde 1970-01-01
+    static const uint16_t diasAcum[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+    uint16_t y = d.year;
+    uint8_t  m = d.month;
+    uint8_t  day = d.day;
+    // Bisiestos desde 1970 hasta año anterior
+    uint32_t bisiestosHasta = (y - 1969) / 4 - (y - 1969) / 100 + (y - 1969) / 400;
+    // Si el mes actual es >= marzo, contar bisiesto de este año
+    bool esBisiesto = ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
+    uint32_t diasDesde1970 = (uint32_t)(y - 1970) * 365UL
+                             + bisiestosHasta
+                             + diasAcum[m - 1]
+                             + (day - 1)
+                             + ((m > 2 && esBisiesto) ? 1 : 0);
+    return diasDesde1970 * 86400UL
+           + (uint32_t)d.hour * 3600UL
+           + (uint32_t)d.minute * 60UL
+           + d.second;
+}
+
+// Lee el RTC del watch y devuelve epoch. Retorna 0 si watch o rtc no disponible.
+static uint32_t leerTimestampRTC() {
+    if (!watch || !watch->rtc) return 0;
+    RTC_Date dt = watch->rtc->getDateTime();
+    if (dt.year < 2020 || dt.year > 2099) return 0;  // RTC no ajustado
+    return rtcToEpoch(dt);
 }
 
 // ─── Log de sesiones (NVS) — claves por usuario ─────────────────────────
@@ -1018,12 +1216,30 @@ void cargarDatosUsuario(uint8_t u) {
 
     if (sesionCount > 0) {
         makeKey(k, "slog", u);
-        size_t expected = sizeof(SesionEntry) * sesionCount;   // 11 bytes/entry
+        size_t expected = sizeof(SesionEntry) * sesionCount;   // 15 bytes/entry
         size_t got = prefs.getBytes(k, sesionLog, expected);
         if (got == expected) {
-            // formato actual, cargado tal cual.
+            // formato actual (v4), cargado tal cual.
+        } else if (got == 11u * sesionCount) {
+            // Formato v3 (11 bytes/entry, sin timestamp). Reinterpretar.
+            uint8_t raw[11 * HIST_LEN];
+            prefs.getBytes(k, raw, got);
+            for (int i = sesionCount - 1; i >= 0; i--) {
+                uint8_t *src = raw + (i * 11);
+                sesionLog[i].num         = ((uint32_t)src[0])        |
+                                           ((uint32_t)src[1] << 8)   |
+                                           ((uint32_t)src[2] << 16)  |
+                                           ((uint32_t)src[3] << 24);
+                sesionLog[i].cohFinales  = (uint16_t)src[4] | ((uint16_t)src[5] << 8);
+                sesionLog[i].duracionSeg = (uint16_t)src[6] | ((uint16_t)src[7] << 8);
+                sesionLog[i].umbralUsado = src[8];
+                sesionLog[i].objetivoMin = src[9];
+                sesionLog[i].gpxsUsado   = src[10];
+                sesionLog[i].timestamp   = 0;
+            }
+            Serial.println("[NVS] log migrado v3 -> v4 (timestamp sin dato historico)");
         } else if (got == 10u * sesionCount) {
-            // Formato v2 (10 bytes/entry, sin gpxsUsado). Reinterpretar.
+            // Formato v2 (10 bytes/entry, sin gpxsUsado ni timestamp).
             uint8_t raw[10 * HIST_LEN];
             prefs.getBytes(k, raw, got);
             for (int i = sesionCount - 1; i >= 0; i--) {
@@ -1037,10 +1253,11 @@ void cargarDatosUsuario(uint8_t u) {
                 sesionLog[i].umbralUsado = src[8];
                 sesionLog[i].objetivoMin = src[9];
                 sesionLog[i].gpxsUsado   = 0;
+                sesionLog[i].timestamp   = 0;
             }
-            Serial.println("[NVS] log migrado v2 -> v3 (gpxs sin dato historico)");
+            Serial.println("[NVS] log migrado v2 -> v4 (gpxs y timestamp sin dato historico)");
         } else if (got == 8u * sesionCount) {
-            // Formato v1 (8 bytes/entry, sin umbral/objetivo/gpxs).
+            // Formato v1 (8 bytes/entry, sin umbral/objetivo/gpxs/timestamp).
             uint8_t raw[8 * HIST_LEN];
             prefs.getBytes(k, raw, got);
             for (int i = sesionCount - 1; i >= 0; i--) {
@@ -1054,8 +1271,9 @@ void cargarDatosUsuario(uint8_t u) {
                 sesionLog[i].umbralUsado = 0;
                 sesionLog[i].objetivoMin = 0;
                 sesionLog[i].gpxsUsado   = 0;
+                sesionLog[i].timestamp   = 0;
             }
-            Serial.println("[NVS] log migrado v1 -> v3 (sin umbral/objetivo/gpxs historicos)");
+            Serial.println("[NVS] log migrado v1 -> v4 (sin umbral/objetivo/gpxs/timestamp)");
         } else {
             sesionCount = 0;   // corrupcion → empezar limpio
         }
@@ -1168,6 +1386,7 @@ void anadirSesionAlLog(uint32_t num, uint16_t coh, uint16_t duracionSeg,
     sesionLog[0].umbralUsado = umbral;
     sesionLog[0].objetivoMin = objetivoMin;
     sesionLog[0].gpxsUsado   = gpxs;
+    sesionLog[0].timestamp   = leerTimestampRTC();
     if (sesionCount < HIST_LEN) sesionCount++;
     guardarLogSesiones();
 }
@@ -1189,7 +1408,13 @@ void setPage(uint8_t newPage) {
     } else {
         cambioUser = CU_IDLE;
     }
+    // Entrar a pagina 5 → cargar hora actual del RTC en variables de edicion.
+    if (newPage == 5) {
+        rtcEditCargar();
+    }
 }
+
+void sdGuardarSesion(uint8_t u, const SesionEntry &s);  // forward declaration
 
 void confirmarNuevaSesion() {
     // Snapshot del contador, duracion y umbral: se grabaran SOLO si A confirma.
@@ -1250,6 +1475,7 @@ void tickSesionBtn(uint32_t now) {
                 // y avanzamos el contador. Si timeout-eamos no se toca nada.
                 anadirSesionAlLog(sesionActual, cohAlGuardar, duracionAlGuardar,
                                   umbralAlGuardar, minutosObjetivo, gpxsAlGuardar);
+                sdGuardarSesion(usuarioActivo, sesionLog[0]);
                 sesionActual++;
                 guardarLogSesiones();
                 Serial.printf("[NVS] sesion #%lu cerrada: %u coh, %u s, umbral %u, objetivo %u min, gpxs %u; proxima=#%lu\n",
@@ -1359,6 +1585,79 @@ void espnowInit() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  SD CARD
+// ════════════════════════════════════════════════════════════════════════════
+
+static bool sdDisponible = false;
+
+// Crea la carpeta del usuario si no existe (idempotente).
+static void sdCrearCarpetaUsuario(uint8_t u) {
+    char path[24];
+    snprintf(path, sizeof(path), "/usuarios/u%u", (unsigned)u);
+    if (!SD.exists("/usuarios")) SD.mkdir("/usuarios");
+    if (!SD.exists(path))       SD.mkdir(path);
+}
+
+// Escribe la cabecera del CSV si el archivo es nuevo.
+static void sdEnsureHeader(const char *path) {
+    if (!SD.exists(path)) {
+        fs::File f = SD.open(path, FILE_WRITE);
+        if (f) {
+            f.println("num,coh,durSeg,umbral,minutos,gpxs,fecha,hora");
+            f.close();
+        }
+    }
+}
+
+// Appende una linea CSV para la sesion dada al archivo del usuario.
+void sdGuardarSesion(uint8_t u, const SesionEntry &s) {
+    if (!sdDisponible) return;
+    sdCrearCarpetaUsuario(u);
+    char path[40];
+    snprintf(path, sizeof(path), "/usuarios/u%u/sesiones.csv", (unsigned)u);
+    sdEnsureHeader(path);
+    fs::File f = SD.open(path, FILE_APPEND);
+    if (!f) {
+        Serial.printf("[SD] No se pudo abrir %s\n", path);
+        return;
+    }
+    // Descomponer timestamp en fecha y hora por separado para el CSV
+    char dtBuf[20];
+    epochToStr(s.timestamp, dtBuf, sizeof(dtBuf));
+    // Separar "YYYY-MM-DD HH:MM:SS" en dos columnas reemplazando el espacio
+    char fechaBuf[12] = "sin fecha";
+    char horaBuf[10]  = "";
+    if (s.timestamp > 0) {
+        // dtBuf tiene formato "YYYY-MM-DD HH:MM:SS"
+        strncpy(fechaBuf, dtBuf, 10);  fechaBuf[10] = '\0';
+        strncpy(horaBuf,  dtBuf + 11, 8); horaBuf[8] = '\0';
+    }
+    f.printf("%lu,%u,%u,%u,%u,%u,%s,%s\n",
+             (unsigned long)s.num,
+             (unsigned)s.cohFinales,
+             (unsigned)s.duracionSeg,
+             (unsigned)s.umbralUsado,
+             (unsigned)s.objetivoMin,
+             (unsigned)s.gpxsUsado,
+             fechaBuf,
+             horaBuf);
+    f.close();
+    Serial.printf("[SD] Sesion #%lu guardada en %s (%s %s)\n",
+                  (unsigned long)s.num, path, fechaBuf, horaBuf);
+}
+
+// Inicializa la SD. No-bloqueante: si falla, sdDisponible queda false.
+static void sdInicializar() {
+    if (watch->sdcard_begin()) {
+        sdDisponible = true;
+        Serial.printf("[SD] OK — %llu MB\n", SD.cardSize() / (1024ULL * 1024ULL));
+    } else {
+        sdDisponible = false;
+        Serial.println("[SD] Sin tarjeta o fallo al montar");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  SETUP
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1371,6 +1670,8 @@ void setup() {
     watch->begin();
     watch->openBL();
     watch->setBrightness(150);
+
+    sdInicializar();
 
     tft = watch->tft;
     tft->setRotation(0);
@@ -1543,9 +1844,57 @@ void handleTouch(int16_t tx, int16_t ty) {
                         cambiarAUsuario(usuarioCandidato);
                         needFullRedraw = true;
                     }
+                } else if (btnHoraLink.dentro(tx, ty)) {
+                    setPage(5);
                 }
             }
             break;
+
+        case 5: {
+            bool redraw = false;
+            if (btnYearUp.dentro(tx, ty)) {
+                if (rtcEditYear < 2099) { rtcEditYear++;  redraw = true; }
+            } else if (btnYearDn.dentro(tx, ty)) {
+                if (rtcEditYear > 2020) { rtcEditYear--;  redraw = true; }
+            } else if (btnMonUp.dentro(tx, ty)) {
+                if (rtcEditMonth < 12)  { rtcEditMonth++; redraw = true; }
+                else                    { rtcEditMonth = 1; redraw = true; }
+            } else if (btnMonDn.dentro(tx, ty)) {
+                if (rtcEditMonth > 1)   { rtcEditMonth--; redraw = true; }
+                else                    { rtcEditMonth = 12; redraw = true; }
+            } else if (btnDayUp.dentro(tx, ty)) {
+                uint8_t mx = diasEnMes(rtcEditYear, rtcEditMonth);
+                if (rtcEditDay < mx) { rtcEditDay++;  redraw = true; }
+                else                 { rtcEditDay = 1; redraw = true; }
+            } else if (btnDayDn.dentro(tx, ty)) {
+                if (rtcEditDay > 1) { rtcEditDay--;  redraw = true; }
+                else                { rtcEditDay = diasEnMes(rtcEditYear, rtcEditMonth); redraw = true; }
+            } else if (btnRtcHourUp.dentro(tx, ty)) {
+                if (rtcEditHour < 23) { rtcEditHour++; redraw = true; }
+                else                  { rtcEditHour = 0; redraw = true; }
+            } else if (btnRtcHourDn.dentro(tx, ty)) {
+                if (rtcEditHour > 0) { rtcEditHour--;  redraw = true; }
+                else                 { rtcEditHour = 23; redraw = true; }
+            } else if (btnRtcMinUp.dentro(tx, ty)) {
+                if (rtcEditMin < 59) { rtcEditMin++; redraw = true; }
+                else                 { rtcEditMin = 0; redraw = true; }
+            } else if (btnRtcMinDn.dentro(tx, ty)) {
+                if (rtcEditMin > 0) { rtcEditMin--;  redraw = true; }
+                else                { rtcEditMin = 59; redraw = true; }
+            } else if (btnRtcSave.dentro(tx, ty)) {
+                if (watch && watch->rtc) {
+                    watch->rtc->setDateTime(rtcEditYear, rtcEditMonth, rtcEditDay,
+                                            rtcEditHour, rtcEditMin, 0);
+                    Serial.printf("[RTC] Hora guardada: %04u-%02u-%02u %02u:%02u:00\n",
+                                  (unsigned)rtcEditYear, (unsigned)rtcEditMonth,
+                                  (unsigned)rtcEditDay,  (unsigned)rtcEditHour,
+                                  (unsigned)rtcEditMin);
+                }
+                setPage(4);   // volver a pagina de usuario
+            }
+            if (redraw) drawPage5Update();
+            break;
+        }
     }
 }
 
@@ -1628,6 +1977,7 @@ void loop() {
                 drawPage4Full();
                 if (cambioUser == CU_CONFIRM) drawCambioUserModal();
                 break;
+            case 5: drawPage5Full(); break;
         }
         lastUiUpdate = 0;   // forzar update inmediato
     }
@@ -1663,6 +2013,7 @@ void loop() {
                 // En modal no actualizamos (es estatico hasta que se cierre)
                 if (cambioUser != CU_CONFIRM) drawPage4Update();
                 break;
+            case 5: drawPage5Update(); break;
         }
     }
 
