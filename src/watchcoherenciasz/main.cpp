@@ -112,6 +112,10 @@ uint32_t umbralLastChange= 0;
 #define MINUTOS_DEF  15
 uint8_t  minutosObjetivo = MINUTOS_DEF;
 bool     autoCierreDisparado = false;   // evita dispararse multiples veces dentro de la misma sesion
+bool     sesionEnEspera = false;        // true = cronometro pausado, esperando START
+bool     sesionNoIniciada = true;       // true = nunca pulsado START, sesion virgen desde boot/cambio usuario
+uint32_t sesionPausadaMs = 0;           // duracion congelada al pausar (para mostrar en UI)
+bool     arrancarTrasEco = false;       // true = al confirmar el eco, arrancar la siguiente sesion en vez de esperar START
 
 // Gapaxionsz: metodo de meditacion seleccionado (por usuario). Solo
 // metadato: no afecta runtime salvo persistencia.
@@ -283,6 +287,7 @@ Boton btnGpxsUp     = { 185, 168, 50, 40 };
 //     165-215: dos botones lado a lado: NUEVA (izq) y BORRAR (der)
 Boton btnPrevSes = {   5, 105, 55, 45 };   // flecha izq (mas reciente)
 Boton btnNextSes = { 180, 105, 55, 45 };   // flecha der (mas antigua)
+Boton btnStart   = { 175,  60, 60, 40 };   // START: encima de la flecha der
 Boton btnGuardar = {  10, 165, 110, 50 };  // NUEVA SESION (izq)
 Boton btnBorrar  = { 130, 165, 100, 50 };  // BORRAR (der)
 
@@ -805,6 +810,31 @@ void drawArrowSes(const Boton &b, bool left, bool habilitado) {
     }
 }
 
+static void drawUserBadge() {
+    // Indicador de usuario activo, encima de la flecha izquierda (x=5,y=60,w=55,h=40)
+    char ubuf[6];
+    snprintf(ubuf, sizeof(ubuf), "U%u", (unsigned)(usuarioActivo + 1));
+    tft->fillRoundRect(5, 60, 55, 40, 6, COLOR_PANEL);
+    tft->drawRoundRect(5, 60, 55, 40, 6, COLOR_LABEL);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(4);
+    tft->setTextColor(COLOR_VALUE, COLOR_PANEL);
+    tft->drawString(ubuf, 5 + 55/2, 60 + 40/2);
+}
+
+static void drawStartButton() {
+    // Verde pulsante cuando en espera, gris cuando la sesion ya corre
+    uint16_t col  = sesionEnEspera ? COLOR_OK    : COLOR_PANEL;
+    uint16_t bord = sesionEnEspera ? TFT_WHITE   : COLOR_LABEL;
+    uint16_t txt  = sesionEnEspera ? TFT_BLACK   : COLOR_LABEL;
+    tft->fillRoundRect(btnStart.x, btnStart.y, btnStart.w, btnStart.h, 6, col);
+    tft->drawRoundRect(btnStart.x, btnStart.y, btnStart.w, btnStart.h, 6, bord);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(txt, col);
+    tft->drawString("START", btnStart.x + btnStart.w / 2, btnStart.y + btnStart.h / 2);
+}
+
 void drawPage3Full() {
     tft->fillScreen(COLOR_BG);
     drawHeader("SESION", true);
@@ -815,6 +845,8 @@ void drawPage3Full() {
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
     tft->drawString("Coherencias", 120, 115);
 
+    drawUserBadge();
+    drawStartButton();
     drawSesionButton();
     drawBorrarButton();
 }
@@ -832,7 +864,8 @@ void drawPage3Update() {
     if (esActual) {
         mostrarNum = sesionActual;
         mostrarCoh = uiNumCoherencias;
-        mostrarMs  = safeElapsed(millis(), sesionStartMs);
+        // Si la sesion esta en espera de START, mostrar el tiempo congelado
+        mostrarMs  = sesionEnEspera ? sesionPausadaMs : safeElapsed(millis(), sesionStartMs);
         // Umbral en vivo: preferir eco de A si esta en rango, si no el local.
         mostrarUmbral   = (uiUmbralActivo >= 40 && uiUmbralActivo <= 99)
                           ? uiUmbralActivo : umbralLocal;
@@ -882,7 +915,11 @@ void drawPage3Update() {
 
     // Linea unificada
     if (esActual) {
-        snprintf(buf, sizeof(buf), "ACTUAL %s %s %s", tBuf, uBuf, gpxBuf);
+        if (sesionNoIniciada) {
+            snprintf(buf, sizeof(buf), "LISTA %s %s %s", tBuf, uBuf, gpxBuf);
+        } else {
+            snprintf(buf, sizeof(buf), "ACTUAL %s %s %s", tBuf, uBuf, gpxBuf);
+        }
     } else {
         snprintf(buf, sizeof(buf), "%u/%u %s %s %s",
                  (unsigned)viewIdx, (unsigned)sesionCount, tBuf, uBuf, gpxBuf);
@@ -942,6 +979,12 @@ void drawPage3Update() {
     tft->setTextFont(1);
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
     tft->drawString(buf, 120, 156);
+
+    // Badge usuario + boton START (solo en vista actual)
+    if (esActual) {
+        drawUserBadge();
+        drawStartButton();
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1292,7 +1335,11 @@ void cargarDatosUsuario(uint8_t u) {
     gapaxionsz = (uint8_t) prefs.getUChar(k, GPXS_DEF);
     if (gapaxionsz < GPXS_MIN || gapaxionsz > GPXS_MAX) gapaxionsz = GPXS_DEF;
 
-    autoCierreDisparado = false;   // reset al cambiar de usuario
+    autoCierreDisparado = false;
+    sesionEnEspera      = true;
+    sesionNoIniciada    = true;
+    sesionPausadaMs     = 0;
+    arrancarTrasEco     = false;
 
     Serial.printf("[NVS] usuario %u cargado: %u sesiones, proxima=#%lu, umbral=%u, objetivo=%u min, gpxs=%u\n",
                   (unsigned)(u + 1), (unsigned)sesionCount,
@@ -1366,6 +1413,10 @@ void cambiarAUsuario(uint8_t nuevo) {
     // Reiniciar cronometro, rearmar auto-cierre, y resetear contador en A
     sesionStartMs       = millis();
     autoCierreDisparado = false;
+    sesionEnEspera      = true;
+    sesionNoIniciada    = true;
+    sesionPausadaMs     = 0;
+    arrancarTrasEco     = false;
     enviarResetAB();
     enviarUmbralAB();   // notifica el umbral del usuario nuevo a A
 
@@ -1486,9 +1537,14 @@ void tickSesionBtn(uint32_t now) {
                               (unsigned)minutosObjetivo,
                               (unsigned)gpxsAlGuardar,
                               (unsigned long)sesionActual);
-                // Reiniciar cronometro y rearmar auto-cierre para la sesion nueva
+                // Nueva sesion: si el usuario pulso START arrancamos directo,
+                // si no (cierre via boton NUEVA), queda esperando START.
                 sesionStartMs       = now;
                 autoCierreDisparado = false;
+                sesionEnEspera      = !arrancarTrasEco;
+                sesionNoIniciada    = false;   // no es virgen: hay una sesion previa guardada
+                sesionPausadaMs     = 0;
+                arrancarTrasEco     = false;
                 needFullRedraw      = true;   // refresca pagina entera (numeros nuevos)
                 sesionBtn      = SBTN_OK;
                 sesionBtnSince = now;
@@ -1496,6 +1552,7 @@ void tickSesionBtn(uint32_t now) {
             } else if (safeElapsed(now, sesionBtnSince) >= ECHO_TIMEOUT_MS) {
                 sesionBtn      = SBTN_FAIL;
                 sesionBtnSince = now;
+                arrancarTrasEco = false;   // si fallo, no auto-arrancar; el usuario decide
                 drawSesionButton();
             }
             break;
@@ -1603,7 +1660,7 @@ static void sdEnsureHeader(const char *path) {
     if (!SD.exists(path)) {
         fs::File f = SD.open(path, FILE_WRITE);
         if (f) {
-            f.println("num,coh,durSeg,umbral,minutos,gpxs,fecha,hora");
+            f.println("num,coh,durSeg,cohPorMin,umbral,minutos,gpxs,fecha,hora");
             f.close();
         }
     }
@@ -1632,10 +1689,22 @@ void sdGuardarSesion(uint8_t u, const SesionEntry &s) {
         strncpy(fechaBuf, dtBuf, 10);  fechaBuf[10] = '\0';
         strncpy(horaBuf,  dtBuf + 11, 8); horaBuf[8] = '\0';
     }
-    f.printf("%lu,%u,%u,%u,%u,%u,%s,%s\n",
+    // Tasa coherencias/min con 2 decimales. Si duracion < 5s se deja 0.00
+    float cohPorMin = 0.0f;
+    if (s.duracionSeg >= 5) {
+        cohPorMin = (float)s.cohFinales * 60.0f / (float)s.duracionSeg;
+    }
+    // Formatear el decimal manualmente para evitar printf %f en ESP32 con SD
+    uint16_t cpmInt  = (uint16_t)cohPorMin;
+    uint8_t  cpmDec  = (uint8_t)((cohPorMin - cpmInt) * 100.0f + 0.5f);
+    if (cpmDec >= 100) { cpmInt++; cpmDec = 0; }
+    char cpmBuf[10];
+    snprintf(cpmBuf, sizeof(cpmBuf), "%u.%02u", (unsigned)cpmInt, (unsigned)cpmDec);
+    f.printf("%lu,%u,%u,%s,%u,%u,%u,%s,%s\n",
              (unsigned long)s.num,
              (unsigned)s.cohFinales,
              (unsigned)s.duracionSeg,
+             cpmBuf,
              (unsigned)s.umbralUsado,
              (unsigned)s.objetivoMin,
              (unsigned)s.gpxsUsado,
@@ -1696,8 +1765,11 @@ void setup() {
     leerBateria();
     batteryLastRead = millis();
 
-    // Cronometro: la "sesion en curso" arranca con el boot
-    sesionStartMs = millis();
+    // Cronometro no arranca hasta que el usuario pulse START en pagina 3
+    sesionEnEspera  = true;
+    sesionNoIniciada = true;
+    sesionPausadaMs  = 0;
+    sesionStartMs    = millis();  // valor inicial; no se usa hasta que START arranque
 
     // Splash 1s
     tft->setTextDatum(MC_DATUM);
@@ -1760,7 +1832,9 @@ void handleTouch(int16_t tx, int16_t ty) {
                 if (minutosObjetivo < MINUTOS_MAX) {
                     minutosObjetivo++;
                     guardarMinutosUsuario();
-                    autoCierreDisparado = false;   // si subio el objetivo, re-armar
+                    autoCierreDisparado = false;
+                    sesionEnEspera      = false;
+                    sesionPausadaMs     = 0;
                     drawPage2Update();
                 }
             } else if (btnMinDown.dentro(tx, ty)) {
@@ -1787,7 +1861,29 @@ void handleTouch(int16_t tx, int16_t ty) {
             break;
 
         case 3:
-            if (btnGuardar.dentro(tx, ty)) {
+            if (btnStart.dentro(tx, ty) && viewIdx == 0) {
+                if (sesionEnEspera) {
+                    if (sesionNoIniciada) {
+                        // Primer START: arrancar cronometro sin guardar nada
+                        sesionStartMs        = millis();
+                        sesionEnEspera       = false;
+                        sesionNoIniciada     = false;
+                        sesionPausadaMs      = 0;
+                        autoCierreDisparado  = false;
+                    } else {
+                        // START tras objetivo cumplido: cerrar sesion y arrancar siguiente.
+                        // Marcamos arrancarTrasEco para que SBTN_WAIT_ECHO arranque
+                        // el cronometro automaticamente cuando A confirme el reset.
+                        arrancarTrasEco = true;
+                        confirmarNuevaSesion();
+                    }
+                    // En ambos casos: actualizar umbral en pagina 2 y enviarlo a A
+                    enviarUmbralAB();
+                    umbralLocalDirty = false;
+                    needFullRedraw   = true;
+                }
+                // Si sesion ya corriendo: ignorar
+            } else if (btnGuardar.dentro(tx, ty)) {
                 onSesionTap();
             } else if (btnBorrar.dentro(tx, ty)) {
                 onBorrarTap();
@@ -1931,19 +2027,24 @@ void loop() {
     }
 
     // 2c. Auto-cierre: si el cronometro supera el objetivo y no estamos
-    //     ya en proceso de cerrar, dispara confirmarNuevaSesion() automatico.
+    //     ya procesando un cierre, congela el cronometro y espera que el
+    //     usuario pulse START para cerrar la sesion e iniciar la siguiente.
     //     Solo si hay link con B (si no hay link, A no recibe el reset).
     if (!autoCierreDisparado &&
+        !sesionEnEspera &&
+        !sesionNoIniciada &&
         sesionBtn == SBTN_IDLE &&
         lastRxMs != 0 &&
         (now - lastRxMs < LINK_TIMEOUT_MS)) {
         uint32_t elapsedSec = safeElapsed(now, sesionStartMs) / 1000;
         if (elapsedSec >= (uint32_t)minutosObjetivo * 60UL) {
-            Serial.printf("[AUTO] objetivo %u min alcanzado (%lu s) -> cierre auto\n",
+            Serial.printf("[AUTO] objetivo %u min alcanzado (%lu s) -> en espera de START\n",
                           (unsigned)minutosObjetivo, (unsigned long)elapsedSec);
             autoCierreDisparado = true;
+            sesionEnEspera  = true;
+            sesionPausadaMs = safeElapsed(now, sesionStartMs);
             vibrarCierre();   // patron haptico descendente, distinto de coherencia
-            confirmarNuevaSesion();
+            if (currentPage == 3) needFullRedraw = true;
         }
     }
 
