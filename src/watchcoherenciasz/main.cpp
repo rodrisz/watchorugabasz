@@ -97,6 +97,12 @@ uint8_t  uiBtConnected   = 0;
 uint8_t  uiPoorSignal    = 200;
 uint8_t  uiAttention     = 0;
 uint8_t  uiMeditation    = 0;
+
+// Buffer circular de ultimos 3 valores para promedios en pagina 3
+static uint8_t attBuf[3]  = {0, 0, 0};
+static uint8_t medBuf[3]  = {0, 0, 0};
+static uint8_t amBufIdx   = 0;   // siguiente posicion a escribir (0-2)
+static bool    amBufFull  = false; // true cuando se llenaron los 3 slots
 uint16_t uiNumCoherencias= 0;
 uint8_t  uiUmbralActivo  = 60;
 
@@ -115,6 +121,7 @@ bool     autoCierreDisparado = false;   // evita dispararse multiples veces dent
 bool     sesionEnEspera = false;        // true = cronometro pausado, esperando START
 bool     sesionNoIniciada = true;       // true = nunca pulsado START, sesion virgen desde boot/cambio usuario
 uint32_t sesionPausadaMs = 0;           // duracion congelada al pausar (para mostrar en UI)
+uint16_t cohCongeladas   = 0;           // coherencias al momento de congelar la sesion
 bool     arrancarTrasEco = false;       // true = al confirmar el eco, arrancar la siguiente sesion en vez de esperar START
 
 // Gapaxionsz: metodo de meditacion seleccionado (por usuario). Solo
@@ -150,6 +157,12 @@ uint32_t        cambioUserSince = 0;
 // Se reinicia con cada NUEVA SESION exitosa y al boot.
 uint32_t sesionStartMs = 0;
 
+// Acumuladores de atencion y meditacion para el promedio total de la sesion actual.
+// Se reinician en cada nueva sesion y al cambiar usuario.
+uint32_t sesAvgAttSum    = 0;
+uint32_t sesAvgMedSum    = 0;
+uint32_t sesAvgSamples   = 0;
+
 // Log circular de sesiones cerradas en NVS del T-Watch.
 //   - sesion actual NO esta en el log (es la que esta en curso).
 //   - log[0] = mas reciente cerrada; log[count-1] = mas antigua.
@@ -163,6 +176,8 @@ typedef struct __attribute__((packed)) {
     uint8_t  objetivoMin;  // minutos objetivo de la sesion (1-60, 0 = sin dato)
     uint8_t  gpxsUsado;    // metodo Gapaxionsz (1-99, 0 = sin dato)
     uint32_t timestamp;    // Unix epoch al cerrar sesion (0 = sin dato / RTC no ajustado)
+    uint8_t  avgAttFinal;  // promedio de atencion de toda la sesion (0 = sin dato)
+    uint8_t  avgMedFinal;  // promedio de meditacion de toda la sesion (0 = sin dato)
 } SesionEntry;
 
 SesionEntry sesionLog[HIST_LEN] = {0};
@@ -810,6 +825,78 @@ void drawArrowSes(const Boton &b, bool left, bool habilitado) {
     }
 }
 
+// Badge M/A en la zona central superior de la pagina 3.
+// M (meditacion) a la derecha del badge usuario, A (atencion) a la izquierda del START.
+// Ambos muestran el promedio de los ultimos 3 datos recibidos con senial valida.
+// Si el promedio esta por debajo del umbral, letra y valor se muestran en rojo.
+static void drawAMBadge() {
+    uint8_t umbral = (uiUmbralActivo >= 40 && uiUmbralActivo <= 99)
+                     ? uiUmbralActivo : umbralLocal;
+
+    // Calcular promedios (con los slots disponibles: 3 si full, sino los escritos)
+    uint8_t slots = amBufFull ? 3 : amBufIdx;
+    uint16_t sumAtt = 0, sumMed = 0;
+    if (slots == 0) {
+        // Sin datos aun: usar ultimo valor conocido como unico dato
+        sumAtt = uiAttention;
+        sumMed = uiMeditation;
+        slots  = 1;
+    } else {
+        for (uint8_t i = 0; i < slots; i++) {
+            sumAtt += attBuf[i];
+            sumMed += medBuf[i];
+        }
+    }
+    uint8_t avgAtt = (uint8_t)(sumAtt / slots);
+    uint8_t avgMed = (uint8_t)(sumMed / slots);
+
+    bool attBajo = (avgAtt < umbral);
+    bool medBajo = (avgMed < umbral);
+
+    uint16_t colAttLabel = attBajo ? TFT_RED : COLOR_LABEL;
+    uint16_t colMedLabel = medBajo ? TFT_RED : COLOR_LABEL;
+    uint16_t colAttVal   = attBajo ? TFT_RED : COLOR_VALUE;
+    uint16_t colMedVal   = medBajo ? TFT_RED : COLOR_VALUE;
+
+    // Zona M: x=65..117, y=60..100 (derecha del badge usuario, izquierda del centro)
+    // Zona A: x=117..172, y=60..100 (derecha del centro, izquierda del START)
+    // Centros: M en x=91, A en x=145
+    const uint16_t xM = 65, wM = 52, xA = 120, wA = 52;
+    const uint16_t yTop = 60, hBox = 40;
+    const uint16_t cxM = xM + wM / 2;
+    const uint16_t cxA = xA + wA / 2;
+
+    char vbuf[8];
+
+    // — Letra M —
+    tft->setTextDatum(BC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(colMedLabel, COLOR_BG);
+    tft->drawString("M", cxM, yTop + 18);
+
+    // — Valor meditacion (limpiar zona del numero antes para evitar residuos 2→1 digito) —
+    tft->fillRect(cxM - 15, yTop + 20, 30, 16, COLOR_BG);
+    snprintf(vbuf, sizeof(vbuf), "%u", (unsigned)avgMed);
+    tft->setTextFont(2);
+    tft->setTextColor(colMedVal, COLOR_BG);
+    tft->setTextDatum(TC_DATUM);
+    tft->drawString(vbuf, cxM, yTop + 20);
+
+    // — Letra A —
+    tft->setTextDatum(BC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(colAttLabel, COLOR_BG);
+    tft->drawString("A", cxA, yTop + 18);
+
+    // — Valor atencion (limpiar zona del numero antes para evitar residuos 2→1 digito) —
+    tft->fillRect(cxA - 15, yTop + 20, 30, 16, COLOR_BG);
+    snprintf(vbuf, sizeof(vbuf), "%u", (unsigned)avgAtt);
+    tft->setTextFont(2);
+    tft->setTextColor(colAttVal, COLOR_BG);
+    tft->setTextDatum(TC_DATUM);
+    tft->drawString(vbuf, cxA, yTop + 20);
+}
+
 static void drawUserBadge() {
     // Indicador de usuario activo, encima de la flecha izquierda (x=5,y=60,w=55,h=40)
     char ubuf[6];
@@ -837,7 +924,7 @@ static void drawStartButton() {
 
 void drawPage3Full() {
     tft->fillScreen(COLOR_BG);
-    drawHeader("SESION", true);
+    drawHeader("", true);   // titulo se pinta en drawPage3Update
 
     // Etiqueta "Coherencias" centrada entre las flechas
     tft->setTextDatum(MC_DATUM);
@@ -846,6 +933,7 @@ void drawPage3Full() {
     tft->drawString("Coherencias", 120, 115);
 
     drawUserBadge();
+    drawAMBadge();
     drawStartButton();
     drawSesionButton();
     drawBorrarButton();
@@ -863,8 +951,7 @@ void drawPage3Update() {
     bool     esActual = (viewIdx == 0);
     if (esActual) {
         mostrarNum = sesionActual;
-        mostrarCoh = uiNumCoherencias;
-        // Si la sesion esta en espera de START, mostrar el tiempo congelado
+        mostrarCoh = sesionEnEspera ? cohCongeladas : uiNumCoherencias;
         mostrarMs  = sesionEnEspera ? sesionPausadaMs : safeElapsed(millis(), sesionStartMs);
         // Umbral en vivo: preferir eco de A si esta en rango, si no el local.
         mostrarUmbral   = (uiUmbralActivo >= 40 && uiUmbralActivo <= 99)
@@ -880,10 +967,19 @@ void drawPage3Update() {
         mostrarObjetivo = sesionLog[idx].objetivoMin;
     }
 
+    // Titulo del header: "SESION #N" — se pinta aqui para incluir el numero
+    {
+        char hbuf[16];
+        snprintf(hbuf, sizeof(hbuf), "SESION #%lu", (unsigned long)mostrarNum);
+        tft->fillRect(56, 0, 120, HEADER_H, COLOR_PANEL);
+        tft->setTextDatum(MC_DATUM);
+        tft->setTextFont(2);
+        tft->setTextColor(TFT_WHITE, COLOR_PANEL);
+        tft->drawString(hbuf, 120, HEADER_H / 2);
+    }
+
     // Cabecera de una linea con tiempo/objetivo + umbral compactos.
     //   "ACTUAL  12:43/15  U:60"   o   "3/7  18:25/15  U:60"
-    tft->fillRect(0, 32, 240, 18, COLOR_BG);
-
     char timeBuf[12];
     formatSesionTime(mostrarMs, timeBuf, sizeof(timeBuf));
 
@@ -929,14 +1025,6 @@ void drawPage3Update() {
     tft->setTextColor(esActual ? COLOR_ACCENT : COLOR_LABEL, COLOR_BG);
     tft->drawString(buf, 120, 42);
 
-    // Numero de sesion grande + fecha debajo (si hay timestamp)
-    tft->fillRect(50, 55, 140, 68, COLOR_BG);
-    snprintf(buf, sizeof(buf), "#%lu", (unsigned long)mostrarNum);
-    tft->setTextDatum(MC_DATUM);
-    tft->setTextFont(6);
-    tft->setTextColor(COLOR_VALUE, COLOR_BG);
-    tft->drawString(buf, 120, 76);
-
     // Fecha de cierre (solo sesiones historicas con timestamp valido)
     uint32_t mostrarTs = esActual ? 0 : sesionLog[viewIdx - 1 < sesionCount ? viewIdx - 1 : 0].timestamp;
     if (!esActual && mostrarTs > 0) {
@@ -946,6 +1034,9 @@ void drawPage3Update() {
         tft->setTextFont(1);
         tft->setTextColor(COLOR_LABEL, COLOR_BG);
         tft->drawString(dtBuf, 120, 106);
+    } else {
+        // Limpiar linea de fecha cuando no hay dato (evita texto fantasma al volver a ACTUAL)
+        tft->fillRect(50, 100, 140, 12, COLOR_BG);
     }
 
     // Flechas (con estado habilitado/deshabilitado)
@@ -956,10 +1047,41 @@ void drawPage3Update() {
     drawArrowSes(btnPrevSes, true,  puedeIzq);
     drawArrowSes(btnNextSes, false, puedeDer);
 
+    // Promedios totales de meditacion (bajo flecha izq) y atencion (bajo flecha der)
+    {
+        uint8_t showAvgMed, showAvgAtt;
+        if (esActual) {
+            showAvgMed = sesAvgSamples > 0 ? (uint8_t)(sesAvgMedSum / sesAvgSamples) : 0;
+            showAvgAtt = sesAvgSamples > 0 ? (uint8_t)(sesAvgAttSum / sesAvgSamples) : 0;
+        } else {
+            uint8_t idx = viewIdx - 1;
+            if (idx >= sesionCount) idx = 0;
+            showAvgMed = sesionLog[idx].avgMedFinal;
+            showAvgAtt = sesionLog[idx].avgAttFinal;
+        }
+        tft->setTextFont(1);
+        tft->setTextColor(COLOR_LABEL, COLOR_BG);
+        // Bajo flecha izq (centro x=32): "Md:XX" o "Md:--"
+        if (showAvgMed > 0) {
+            snprintf(buf, sizeof(buf), "Md:%u", (unsigned)showAvgMed);
+        } else {
+            snprintf(buf, sizeof(buf), "Md:--");
+        }
+        tft->setTextDatum(TC_DATUM);
+        tft->fillRect(5, 151, 55, 10, COLOR_BG);
+        tft->drawString(buf, 32, 152);
+        // Bajo flecha der (centro x=207): "At:XX" o "At:--"
+        if (showAvgAtt > 0) {
+            snprintf(buf, sizeof(buf), "At:%u", (unsigned)showAvgAtt);
+        } else {
+            snprintf(buf, sizeof(buf), "At:--");
+        }
+        tft->fillRect(180, 151, 55, 10, COLOR_BG);
+        tft->drawString(buf, 207, 152);
+    }
+
     // Coherencias (valor grande) + tasa cpm (linea pequena debajo).
     // Zona total entre flechas: y=125-160, ancho 110 (x=65-175).
-    tft->fillRect(65, 125, 110, 35, COLOR_BG);
-
     // Valor de coherencias
     snprintf(buf, sizeof(buf), "%u", (unsigned)mostrarCoh);
     tft->setTextDatum(MC_DATUM);
@@ -978,11 +1100,13 @@ void drawPage3Update() {
     }
     tft->setTextFont(1);
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
+    tft->fillRect(83, 151, 74, 10, COLOR_BG);
     tft->drawString(buf, 120, 156);
 
-    // Badge usuario + boton START (solo en vista actual)
+    // Badge usuario + indicadores AM + boton START (solo en vista actual)
     if (esActual) {
         drawUserBadge();
+        drawAMBadge();
         drawStartButton();
     }
 }
@@ -1259,10 +1383,33 @@ void cargarDatosUsuario(uint8_t u) {
 
     if (sesionCount > 0) {
         makeKey(k, "slog", u);
-        size_t expected = sizeof(SesionEntry) * sesionCount;   // 15 bytes/entry
+        size_t expected = sizeof(SesionEntry) * sesionCount;   // 17 bytes/entry (v5)
         size_t got = prefs.getBytes(k, sesionLog, expected);
         if (got == expected) {
-            // formato actual (v4), cargado tal cual.
+            // formato actual (v5), cargado tal cual.
+        } else if (got == 15u * sesionCount) {
+            // Formato v4 (15 bytes/entry, sin avgAttFinal/avgMedFinal). Reinterpretar.
+            uint8_t raw[15 * HIST_LEN];
+            prefs.getBytes(k, raw, got);
+            for (int i = sesionCount - 1; i >= 0; i--) {
+                uint8_t *src = raw + (i * 15);
+                sesionLog[i].num         = ((uint32_t)src[0])        |
+                                           ((uint32_t)src[1] << 8)   |
+                                           ((uint32_t)src[2] << 16)  |
+                                           ((uint32_t)src[3] << 24);
+                sesionLog[i].cohFinales  = (uint16_t)src[4] | ((uint16_t)src[5] << 8);
+                sesionLog[i].duracionSeg = (uint16_t)src[6] | ((uint16_t)src[7] << 8);
+                sesionLog[i].umbralUsado = src[8];
+                sesionLog[i].objetivoMin = src[9];
+                sesionLog[i].gpxsUsado   = src[10];
+                sesionLog[i].timestamp   = ((uint32_t)src[11])       |
+                                           ((uint32_t)src[12] << 8)  |
+                                           ((uint32_t)src[13] << 16) |
+                                           ((uint32_t)src[14] << 24);
+                sesionLog[i].avgAttFinal = 0;
+                sesionLog[i].avgMedFinal = 0;
+            }
+            Serial.println("[NVS] log migrado v4 -> v5 (avgAtt/avgMed sin dato historico)");
         } else if (got == 11u * sesionCount) {
             // Formato v3 (11 bytes/entry, sin timestamp). Reinterpretar.
             uint8_t raw[11 * HIST_LEN];
@@ -1279,8 +1426,10 @@ void cargarDatosUsuario(uint8_t u) {
                 sesionLog[i].objetivoMin = src[9];
                 sesionLog[i].gpxsUsado   = src[10];
                 sesionLog[i].timestamp   = 0;
+                sesionLog[i].avgAttFinal = 0;
+                sesionLog[i].avgMedFinal = 0;
             }
-            Serial.println("[NVS] log migrado v3 -> v4 (timestamp sin dato historico)");
+            Serial.println("[NVS] log migrado v3 -> v5 (timestamp/avgAtt/avgMed sin dato historico)");
         } else if (got == 10u * sesionCount) {
             // Formato v2 (10 bytes/entry, sin gpxsUsado ni timestamp).
             uint8_t raw[10 * HIST_LEN];
@@ -1297,8 +1446,10 @@ void cargarDatosUsuario(uint8_t u) {
                 sesionLog[i].objetivoMin = src[9];
                 sesionLog[i].gpxsUsado   = 0;
                 sesionLog[i].timestamp   = 0;
+                sesionLog[i].avgAttFinal = 0;
+                sesionLog[i].avgMedFinal = 0;
             }
-            Serial.println("[NVS] log migrado v2 -> v4 (gpxs y timestamp sin dato historico)");
+            Serial.println("[NVS] log migrado v2 -> v5 (gpxs/timestamp/avgAtt/avgMed sin dato historico)");
         } else if (got == 8u * sesionCount) {
             // Formato v1 (8 bytes/entry, sin umbral/objetivo/gpxs/timestamp).
             uint8_t raw[8 * HIST_LEN];
@@ -1315,10 +1466,12 @@ void cargarDatosUsuario(uint8_t u) {
                 sesionLog[i].objetivoMin = 0;
                 sesionLog[i].gpxsUsado   = 0;
                 sesionLog[i].timestamp   = 0;
+                sesionLog[i].avgAttFinal = 0;
+                sesionLog[i].avgMedFinal = 0;
             }
-            Serial.println("[NVS] log migrado v1 -> v4 (sin umbral/objetivo/gpxs/timestamp)");
+            Serial.println("[NVS] log migrado v1 -> v5 (sin umbral/objetivo/gpxs/timestamp/avgAtt/avgMed)");
         } else {
-            sesionCount = 0;   // corrupcion → empezar limpio
+            sesionCount = 0;   // corrupcion -> empezar limpio
         }
     }
 
@@ -1340,6 +1493,13 @@ void cargarDatosUsuario(uint8_t u) {
     sesionNoIniciada    = true;
     sesionPausadaMs     = 0;
     arrancarTrasEco     = false;
+    amBufIdx            = 0;
+    amBufFull           = false;
+    memset(attBuf, 0, sizeof(attBuf));
+    memset(medBuf, 0, sizeof(medBuf));
+    sesAvgAttSum        = 0;
+    sesAvgMedSum        = 0;
+    sesAvgSamples       = 0;
 
     Serial.printf("[NVS] usuario %u cargado: %u sesiones, proxima=#%lu, umbral=%u, objetivo=%u min, gpxs=%u\n",
                   (unsigned)(u + 1), (unsigned)sesionCount,
@@ -1417,6 +1577,13 @@ void cambiarAUsuario(uint8_t nuevo) {
     sesionNoIniciada    = true;
     sesionPausadaMs     = 0;
     arrancarTrasEco     = false;
+    amBufIdx            = 0;
+    amBufFull           = false;
+    memset(attBuf, 0, sizeof(attBuf));
+    memset(medBuf, 0, sizeof(medBuf));
+    sesAvgAttSum        = 0;
+    sesAvgMedSum        = 0;
+    sesAvgSamples       = 0;
     enviarResetAB();
     enviarUmbralAB();   // notifica el umbral del usuario nuevo a A
 
@@ -1438,6 +1605,12 @@ void anadirSesionAlLog(uint32_t num, uint16_t coh, uint16_t duracionSeg,
     sesionLog[0].objetivoMin = objetivoMin;
     sesionLog[0].gpxsUsado   = gpxs;
     sesionLog[0].timestamp   = leerTimestampRTC();
+    sesionLog[0].avgAttFinal = sesAvgSamples > 0 ? (uint8_t)(sesAvgAttSum / sesAvgSamples) : 0;
+    sesionLog[0].avgMedFinal = sesAvgSamples > 0 ? (uint8_t)(sesAvgMedSum / sesAvgSamples) : 0;
+    // Resetear acumuladores para la proxima sesion
+    sesAvgAttSum  = 0;
+    sesAvgMedSum  = 0;
+    sesAvgSamples = 0;
     if (sesionCount < HIST_LEN) sesionCount++;
     guardarLogSesiones();
 }
@@ -1469,8 +1642,10 @@ void sdGuardarSesion(uint8_t u, const SesionEntry &s);  // forward declaration
 
 void confirmarNuevaSesion() {
     // Snapshot del contador, duracion y umbral: se grabaran SOLO si A confirma.
-    cohAlGuardar      = uiNumCoherencias;
-    uint32_t elapsedSec = safeElapsed(millis(), sesionStartMs) / 1000;
+    // Si la sesion ya fue congelada por auto-cierre, usar los valores congelados
+    cohAlGuardar = sesionEnEspera ? cohCongeladas : uiNumCoherencias;
+    uint32_t elapsedMs  = sesionEnEspera ? sesionPausadaMs : safeElapsed(millis(), sesionStartMs);
+    uint32_t elapsedSec = elapsedMs / 1000;
     duracionAlGuardar = (elapsedSec > UINT16_MAX) ? UINT16_MAX : (uint16_t)elapsedSec;
     // Preferimos el eco real que reporta A (uiUmbralActivo). Si A no ha
     // reportado aun, caemos al umbralLocal de la UI.
@@ -1660,7 +1835,7 @@ static void sdEnsureHeader(const char *path) {
     if (!SD.exists(path)) {
         fs::File f = SD.open(path, FILE_WRITE);
         if (f) {
-            f.println("num,coh,durSeg,cohPorMin,umbral,minutos,gpxs,fecha,hora");
+            f.println("num,coh,durSeg,cohPorMin,umbral,minutos,gpxs,avgAtt,avgMed,fecha,hora");
             f.close();
         }
     }
@@ -1700,7 +1875,7 @@ void sdGuardarSesion(uint8_t u, const SesionEntry &s) {
     if (cpmDec >= 100) { cpmInt++; cpmDec = 0; }
     char cpmBuf[10];
     snprintf(cpmBuf, sizeof(cpmBuf), "%u.%02u", (unsigned)cpmInt, (unsigned)cpmDec);
-    f.printf("%lu,%u,%u,%s,%u,%u,%u,%s,%s\n",
+    f.printf("%lu,%u,%u,%s,%u,%u,%u,%u,%u,%s,%s\n",
              (unsigned long)s.num,
              (unsigned)s.cohFinales,
              (unsigned)s.duracionSeg,
@@ -1708,6 +1883,8 @@ void sdGuardarSesion(uint8_t u, const SesionEntry &s) {
              (unsigned)s.umbralUsado,
              (unsigned)s.objetivoMin,
              (unsigned)s.gpxsUsado,
+             (unsigned)s.avgAttFinal,
+             (unsigned)s.avgMedFinal,
              fechaBuf,
              horaBuf);
     f.close();
@@ -1863,21 +2040,13 @@ void handleTouch(int16_t tx, int16_t ty) {
         case 3:
             if (btnStart.dentro(tx, ty) && viewIdx == 0) {
                 if (sesionEnEspera) {
-                    if (sesionNoIniciada) {
-                        // Primer START: arrancar cronometro sin guardar nada
-                        sesionStartMs        = millis();
-                        sesionEnEspera       = false;
-                        sesionNoIniciada     = false;
-                        sesionPausadaMs      = 0;
-                        autoCierreDisparado  = false;
-                    } else {
-                        // START tras objetivo cumplido: cerrar sesion y arrancar siguiente.
-                        // Marcamos arrancarTrasEco para que SBTN_WAIT_ECHO arranque
-                        // el cronometro automaticamente cuando A confirme el reset.
-                        arrancarTrasEco = true;
-                        confirmarNuevaSesion();
-                    }
-                    // En ambos casos: actualizar umbral en pagina 2 y enviarlo a A
+                    // START arranca el cronometro; la sesion anterior ya fue
+                    // guardada automaticamente al cumplirse el tiempo.
+                    sesionStartMs       = millis();
+                    sesionEnEspera      = false;
+                    sesionNoIniciada    = false;
+                    sesionPausadaMs     = 0;
+                    autoCierreDisparado = false;
                     enviarUmbralAB();
                     umbralLocalDirty = false;
                     needFullRedraw   = true;
@@ -2011,8 +2180,19 @@ void loop() {
         uiNumCoherencias = paqueteRx.numCoherencias;
         uiUmbralActivo   = paqueteRx.umbralActivo;
 
-        // Disparar vibracion en evento nuevo
-        if (paqueteRx.nuevoEvento && !vibrando) {
+        // Acumular en buffer de promedios AM (solo con senial valida y sesion activa)
+        if (uiPoorSignal == 0 && uiBtConnected && !sesionEnEspera && !sesionNoIniciada) {
+            attBuf[amBufIdx] = uiAttention;
+            medBuf[amBufIdx] = uiMeditation;
+            amBufIdx = (amBufIdx + 1) % 3;
+            if (amBufIdx == 0) amBufFull = true;
+            sesAvgAttSum  += uiAttention;
+            sesAvgMedSum  += uiMeditation;
+            sesAvgSamples++;
+        }
+
+        // Disparar vibracion en evento nuevo (no si la sesion ya termino)
+        if (paqueteRx.nuevoEvento && !vibrando && !sesionEnEspera) {
             vibrarStart();
         }
     }
@@ -2043,7 +2223,11 @@ void loop() {
             autoCierreDisparado = true;
             sesionEnEspera  = true;
             sesionPausadaMs = safeElapsed(now, sesionStartMs);
-            vibrarCierre();   // patron haptico descendente, distinto de coherencia
+            cohCongeladas   = uiNumCoherencias;
+            vibrarCierre();
+            // Guardar automaticamente; la siguiente sesion espera START del usuario
+            arrancarTrasEco = false;
+            confirmarNuevaSesion();
             if (currentPage == 3) needFullRedraw = true;
         }
     }
