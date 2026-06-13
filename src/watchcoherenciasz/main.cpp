@@ -131,6 +131,47 @@ bool     arrancarTrasEco = false;       // true = al confirmar el eco, arrancar 
 #define GPXS_DEF  1
 uint8_t  gapaxionsz = GPXS_DEF;
 
+// ChiszIlence: ejercicio de silencio/mindfulness seleccionado (por usuario).
+// Ampliar CHISZ_MAX para añadir más ChiszIlences sin tocar otra lógica.
+#define CHISZ_MAX  9      // ChiszIlences disponibles (1..CHISZ_MAX)
+#define CHISZ_DEF  1
+uint8_t  chiszIdx    = CHISZ_DEF;   // 1..CHISZ_MAX — el seleccionado
+bool     chiszActivo = false;        // true = un ChiszIlence está activo
+
+// ─── ChiszIlence1 — máquina de estados ──────────────────────────────────────
+// Secuencia por ronda: ESPERA(10s) -> VIBRA -> LECTURA(10s) -> EVALUA -> repite
+// Vibracion seal: 1 pulso = mantener quieto, 2 pulsos = flexion de muneca.
+// Evaluacion BMA423: varianza eje Z (quietud) + pico eje Z (flexion).
+#define CZ1_WAIT_MS        10000UL  // 10s pre-vibración y 10s post-vibración
+#define CZ1_ZVAR_UMBRAL    300      // varianza eje Z²: por debajo = quieto
+#define CZ1_ZPICO_UMBRAL   500      // pico eje Z (desviación de reposo): encima = flexión
+
+enum Chisz1State {
+    CZ1_OFF,       // desactivado o sesion no iniciada
+    CZ1_PRE_WAIT,  // 10s iniciales antes de la primera vibracion
+    CZ1_VIBRA,     // vibración en curso (1 o 2 pulsos)
+    CZ1_LECTURA,   // 10s de lectura BMA423
+    CZ1_EVALUA     // evaluación instantánea → vuelve a PRE_WAIT
+};
+
+Chisz1State chisz1Estado    = CZ1_OFF;
+uint32_t    chisz1PhaseMs   = 0;     // millis() cuando empezo la fase actual
+uint8_t     chisz1Signal    = 0;     // 1 = quietud, 2 = flexion (aleatorio)
+uint8_t     chisz1Aciertos  = 0;     // aciertos acumulados en sesion
+uint8_t     chisz1Fallos    = 0;     // fallos acumulados en sesion
+
+// Acumuladores BMA423 durante la fase LECTURA
+int32_t     cz1ZSum         = 0;
+int32_t     cz1ZSumSq       = 0;
+int32_t     cz1ZMax         = INT32_MIN;
+int32_t     cz1ZMin         = INT32_MAX;
+uint16_t    cz1ZSamples     = 0;
+uint32_t    cz1BmaLastMs    = 0;     // ultima lectura BMA423
+#define     CZ1_BMA_INTERVAL_MS  50  // leer BMA cada 50ms durante LECTURA
+
+// Patron de vibracion senal (1 pulso = efecto 1, 2 pulsos = efectos 1+1)
+static const uint8_t VIBRATE_PATTERN_CZ1[] = { 1, 1 };  // Strong Click x2
+
 // Sesion (pagina 3)
 Preferences prefs;
 
@@ -169,16 +210,18 @@ uint32_t sesAvgSamples   = 0;
 //   - HIST_LEN = 50 entradas × 15 bytes = 750 bytes, holgado para NVS.
 #define HIST_LEN 50
 typedef struct __attribute__((packed)) {
-    uint32_t num;          // numero de sesion
-    uint16_t cohFinales;   // coherencias al cerrar
-    uint16_t duracionSeg;  // duracion total en segundos (max 18 h)
-    uint8_t  umbralUsado;  // umbral activo al cerrar (40-99, 0 = sin dato)
-    uint8_t  objetivoMin;  // minutos objetivo de la sesion (1-60, 0 = sin dato)
-    uint8_t  gpxsUsado;    // metodo Gapaxionsz (1-99, 0 = sin dato)
-    uint32_t timestamp;    // Unix epoch al cerrar sesion (0 = sin dato / RTC no ajustado)
-    uint8_t  avgAttFinal;  // promedio de atencion de toda la sesion (0 = sin dato)
-    uint8_t  avgMedFinal;  // promedio de meditacion de toda la sesion (0 = sin dato)
-} SesionEntry;
+    uint32_t num;            // numero de sesion
+    uint16_t cohFinales;     // coherencias al cerrar
+    uint16_t duracionSeg;    // duracion total en segundos (max 18 h)
+    uint8_t  umbralUsado;    // umbral activo al cerrar (40-99, 0 = sin dato)
+    uint8_t  objetivoMin;    // minutos objetivo de la sesion (1-60, 0 = sin dato)
+    uint8_t  gpxsUsado;      // metodo Gapaxionsz (1-99, 0 = sin dato)
+    uint32_t timestamp;      // Unix epoch al cerrar sesion (0 = sin dato / RTC no ajustado)
+    uint8_t  avgAttFinal;    // promedio de atencion de toda la sesion (0 = sin dato)
+    uint8_t  avgMedFinal;    // promedio de meditacion de toda la sesion (0 = sin dato)
+    uint8_t  chisz1Aciertos; // ChiszIlence1: respuestas correctas (0 si no activo)
+    uint8_t  chisz1Fallos;   // ChiszIlence1: respuestas incorrectas (0 si no activo)
+} SesionEntry;  // v6 = 19 bytes
 
 SesionEntry sesionLog[HIST_LEN] = {0};
 uint8_t     sesionCount   = 0;      // cuantas entradas validas hay (0..HIST_LEN)
@@ -267,12 +310,20 @@ struct Boton {
 
 Boton btnMenu     = { 5, 5, 60, HEADER_H };
 
-// Pagina 0
-// Pagina 0: 4 botones mas compactos para dar lugar al boton USUARIO
-Boton btnP1 = { 20,  62, 200, 36 };   // DATOS
-Boton btnP2 = { 20, 102, 200, 36 };   // UMBRAL
-Boton btnP3 = { 20, 142, 200, 36 };   // SESION
-Boton btnP4 = { 20, 182, 200, 36 };   // USUARIO
+// Pagina 0: 5 botones compactos
+Boton btnP1 = { 20,  48, 200, 32 };   // DATOS
+Boton btnP2 = { 20,  84, 200, 32 };   // UMBRAL
+Boton btnP3 = { 20, 120, 200, 32 };   // SESION
+Boton btnP4 = { 20, 156, 200, 32 };   // USUARIO
+Boton btnP6 = { 20, 192, 200, 32 };   // MENU2
+
+// Pagina 6 — MENU2
+Boton btnP7 = { 20, 80, 200, 45 };   // CHISZILENCES
+
+// Pagina 7 — CHISZILENCES
+Boton btnChiszDown   = {   5,  90, 55, 50 };   // flecha izq — disminuye
+Boton btnChiszUp     = { 180,  90, 55, 50 };   // flecha der — aumenta
+Boton btnChiszToggle = {  20, 170, 200, 48 };  // ACTIVA / DESACTIVA
 
 // Pagina 2 — filas horizontales tipo "selector".
 //   3 filas de ~55 px de alto. Flecha izq (◀) disminuye, der (▶) aumenta.
@@ -303,8 +354,8 @@ Boton btnGpxsUp     = { 185, 168, 50, 40 };
 Boton btnPrevSes = {   5, 105, 55, 45 };   // flecha izq (mas reciente)
 Boton btnNextSes = { 180, 105, 55, 45 };   // flecha der (mas antigua)
 Boton btnStart   = { 175,  60, 60, 40 };   // START: encima de la flecha der
-Boton btnGuardar = {  10, 165, 110, 50 };  // NUEVA SESION (izq)
-Boton btnBorrar  = { 130, 165, 100, 50 };  // BORRAR (der)
+Boton btnGuardar = {  10, 192, 110, 38 };  // NUEVA SESION (izq)
+Boton btnBorrar  = { 130, 192, 100, 38 };  // BORRAR (der)
 
 // Pagina 4 — seleccion de usuario
 Boton btnUserDown   = {   5, 105, 55, 50 };   // flecha izq → disminuir
@@ -449,6 +500,152 @@ void vibrarTick(uint32_t now) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  CHISZILENCE 1 — máquina de estados no bloqueante
+// ════════════════════════════════════════════════════════════════════════════
+
+static void cz1ResetAcum() {
+    cz1ZSum     = 0;
+    cz1ZSumSq   = 0;
+    cz1ZMax     = INT32_MIN;
+    cz1ZMin     = INT32_MAX;
+    cz1ZSamples = 0;
+}
+
+// Llama a esto cuando arranca la sesion (START pulsado) con ChiszIlence1 activo
+void chisz1Start() {
+    chisz1Aciertos = 0;
+    chisz1Fallos   = 0;
+    chisz1Estado   = CZ1_PRE_WAIT;
+    chisz1PhaseMs  = millis();
+    cz1ResetAcum();
+    Serial.println("[CZ1] iniciado");
+}
+
+// Llama a esto al parar la sesion (auto-cierre o cambio usuario)
+void chisz1Stop() {
+    chisz1Estado = CZ1_OFF;
+    Serial.println("[CZ1] detenido");
+}
+
+// Dispara la vibracion de senal: 1 pulso (quietud) o 2 pulsos (flexion)
+static void cz1Vibrar(uint8_t senal) {
+    if (!watch || !watch->drv) return;
+    if (senal == 1) {
+        vibrarStartPattern(VIBRATE_PATTERN_CZ1, 1, 400UL, 800UL);
+    } else {
+        vibrarStartPattern(VIBRATE_PATTERN_CZ1, 2, 400UL, 1200UL);
+    }
+}
+
+// Devuelve true si hubo flexión de muñeca (pico Z > umbral respecto a la media)
+static bool cz1EvalFlexion() {
+    if (cz1ZSamples == 0) return false;
+    int32_t media = cz1ZSum / (int32_t)cz1ZSamples;
+    int32_t picoPos = cz1ZMax - media;
+    int32_t picoNeg = media - cz1ZMin;
+    int32_t pico = (picoPos > picoNeg) ? picoPos : picoNeg;
+    return pico > CZ1_ZPICO_UMBRAL;
+}
+
+// Devuelve true si la mano estuvo quieta (varianza Z < umbral)
+static bool cz1EvalQuieto() {
+    if (cz1ZSamples == 0) return true;
+    int32_t media = cz1ZSum / (int32_t)cz1ZSamples;
+    // varianza = mean(z²) - mean(z)²
+    int32_t meanSq = cz1ZSumSq / (int32_t)cz1ZSamples;
+    int32_t var    = meanSq - (media * media);
+    if (var < 0) var = -var;
+    return var < CZ1_ZVAR_UMBRAL;
+}
+
+void chisz1Tick(uint32_t now) {
+    if (chisz1Estado == CZ1_OFF) return;
+
+    switch (chisz1Estado) {
+
+        case CZ1_PRE_WAIT:
+            if (now - chisz1PhaseMs >= CZ1_WAIT_MS) {
+                // Elegir senal aleatoria
+                chisz1Signal   = (random(2) == 0) ? 1 : 2;
+                chisz1Estado  = CZ1_VIBRA;
+                chisz1PhaseMs = now;
+                cz1ResetAcum();
+                cz1BmaLastMs = now;
+                cz1Vibrar(chisz1Signal);
+                Serial.printf("[CZ1] senal=%u (1=quieto,2=flexion)\n", (unsigned)chisz1Signal);
+            }
+            break;
+
+        case CZ1_VIBRA:
+            // Leer BMA ya durante la fase de vibración para no perder muestras
+            if (now - cz1BmaLastMs >= CZ1_BMA_INTERVAL_MS) {
+                cz1BmaLastMs = now;
+                if (watch && watch->bma) {
+                    Accel acc;
+                    if (watch->bma->getAccel(acc)) {
+                        int32_t z = (int32_t)acc.z;
+                        cz1ZSum   += z;
+                        cz1ZSumSq += z * z;
+                        if (z > cz1ZMax) cz1ZMax = z;
+                        if (z < cz1ZMin) cz1ZMin = z;
+                        cz1ZSamples++;
+                    }
+                }
+            }
+            // Esperar a que la vibración termine + ir a LECTURA
+            if (!vibrando && now - chisz1PhaseMs >= 600UL) {
+                chisz1Estado  = CZ1_LECTURA;
+                chisz1PhaseMs = now;
+            }
+            break;
+
+        case CZ1_LECTURA:
+            // Leer BMA cada 50ms durante 10s
+            if (now - cz1BmaLastMs >= CZ1_BMA_INTERVAL_MS) {
+                cz1BmaLastMs = now;
+                if (watch && watch->bma) {
+                    Accel acc;
+                    if (watch->bma->getAccel(acc)) {
+                        int32_t z = (int32_t)acc.z;
+                        cz1ZSum   += z;
+                        cz1ZSumSq += z * z;
+                        if (z > cz1ZMax) cz1ZMax = z;
+                        if (z < cz1ZMin) cz1ZMin = z;
+                        cz1ZSamples++;
+                    }
+                }
+            }
+            if (now - chisz1PhaseMs >= CZ1_WAIT_MS) {
+                chisz1Estado  = CZ1_EVALUA;
+                chisz1PhaseMs = now;
+            }
+            break;
+
+        case CZ1_EVALUA: {
+            bool huboFlexion = cz1EvalFlexion();
+            bool estuvoQuieto = cz1EvalQuieto();
+            bool esAcierto = (chisz1Signal == 1) ? estuvoQuieto : huboFlexion;
+            if (esAcierto) {
+                if (chisz1Aciertos < 255) chisz1Aciertos++;
+                Serial.printf("[CZ1] ACIERTO (senal=%u, quieto=%d, flex=%d)\n",
+                              (unsigned)chisz1Signal, (int)estuvoQuieto, (int)huboFlexion);
+            } else {
+                if (chisz1Fallos < 255) chisz1Fallos++;
+                Serial.printf("[CZ1] FALLO (senal=%u, quieto=%d, flex=%d)\n",
+                              (unsigned)chisz1Signal, (int)estuvoQuieto, (int)huboFlexion);
+            }
+            cz1ResetAcum();
+            chisz1Estado  = CZ1_PRE_WAIT;
+            chisz1PhaseMs = now;
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  DIBUJO COMUN
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -576,25 +773,20 @@ void drawPage0Full() {
     tft->setTextFont(2);
     tft->drawString("Mindcoherenciasz", 127, HEADER_H / 2);
 
-    // Indicador NeuroSky (etiqueta fija; valor se redibuja en update)
-    tft->setTextDatum(ML_DATUM);
-    tft->setTextFont(2);
-    tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->drawString("NeuroSky:", 10, 45);
-
-    // Botones (font 2 porque ahora son mas bajitos)
+    // Botones (font 2 porque son mas bajitos con 5 botones)
     auto drawBtn = [](Boton b, const char *t, uint16_t col) {
         tft->fillRoundRect(b.x, b.y, b.w, b.h, 6, col);
         tft->drawRoundRect(b.x, b.y, b.w, b.h, 6, TFT_WHITE);
         tft->setTextColor(TFT_WHITE, col);
         tft->setTextDatum(MC_DATUM);
-        tft->setTextFont(4);
+        tft->setTextFont(2);
         tft->drawString(t, b.x + b.w/2, b.y + b.h/2);
     };
 
     drawBtn(btnP1, "1 DATOS",   COLOR_BTN);
     drawBtn(btnP2, "2 UMBRAL",  COLOR_BTN2);
     drawBtn(btnP3, "3 SESION",  COLOR_BTN3);
+    drawBtn(btnP6, "5 MENU2",   COLOR_BTN3);
 
     // Boton USUARIO con numero actual incluido (se redibuja en update tambien)
     char buf[16];
@@ -603,29 +795,18 @@ void drawPage0Full() {
 }
 
 void drawPage0Update(uint32_t now) {
-    // Batteria (se redibuja con cualquier cambio)
+    // Bateria en header
     drawBatteryWidget(5, 8);
 
-    // Estado NeuroSky: solo la zona del valor (la etiqueta es fija)
-    tft->fillRect(85, 35, 155, 20, COLOR_BG);
-
-    bool linkUp = (lastRxMs != 0) && (now - lastRxMs < LINK_TIMEOUT_MS);
-    const char *ns;
-    uint16_t nc;
-    if (!linkUp) {
-        ns = "SIN PUENTE";
-        nc = COLOR_ERR;
-    } else if (uiBtConnected) {
-        ns = "CONECTADO";
-        nc = COLOR_OK;
-    } else {
-        ns = "DESCONECTADO";
-        nc = COLOR_ERR;
-    }
-    tft->setTextDatum(ML_DATUM);
+    // Boton USUARIO: redibuja solo su texto (numero de usuario puede cambiar)
+    char buf[16];
+    snprintf(buf, sizeof(buf), "4 USUARIO %u", (unsigned)(usuarioActivo + 1));
+    tft->fillRoundRect(btnP4.x, btnP4.y, btnP4.w, btnP4.h, 6, COLOR_ACCENT);
+    tft->drawRoundRect(btnP4.x, btnP4.y, btnP4.w, btnP4.h, 6, TFT_WHITE);
+    tft->setTextDatum(MC_DATUM);
     tft->setTextFont(2);
-    tft->setTextColor(nc, COLOR_BG);
-    tft->drawString(ns, 90, 45);
+    tft->setTextColor(TFT_WHITE, COLOR_ACCENT);
+    tft->drawString(buf, btnP4.x + btnP4.w / 2, btnP4.y + btnP4.h / 2);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1009,16 +1190,27 @@ void drawPage3Update() {
         snprintf(gpxBuf, sizeof(gpxBuf), "Gx--");
     }
 
+    // Fragmento ChiszIlence ("chisz3" o "")
+    char czBuf[10];
+    if (chiszActivo) {
+        snprintf(czBuf, sizeof(czBuf), "chisz%u", (unsigned)chiszIdx);
+    } else {
+        czBuf[0] = '\0';
+    }
+
     // Linea unificada
     if (esActual) {
         if (sesionNoIniciada) {
-            snprintf(buf, sizeof(buf), "LISTA %s %s %s", tBuf, uBuf, gpxBuf);
+            snprintf(buf, sizeof(buf), "LISTA %s %s %s%s%s", tBuf, uBuf, gpxBuf,
+                     czBuf[0] ? " " : "", czBuf);
         } else {
-            snprintf(buf, sizeof(buf), "ACTUAL %s %s %s", tBuf, uBuf, gpxBuf);
+            snprintf(buf, sizeof(buf), "ACTUAL %s %s %s%s%s", tBuf, uBuf, gpxBuf,
+                     czBuf[0] ? " " : "", czBuf);
         }
     } else {
-        snprintf(buf, sizeof(buf), "%u/%u %s %s %s",
-                 (unsigned)viewIdx, (unsigned)sesionCount, tBuf, uBuf, gpxBuf);
+        snprintf(buf, sizeof(buf), "%u/%u %s %s %s%s%s",
+                 (unsigned)viewIdx, (unsigned)sesionCount, tBuf, uBuf, gpxBuf,
+                 czBuf[0] ? " " : "", czBuf);
     }
     tft->setTextDatum(MC_DATUM);
     tft->setTextFont(2);
@@ -1103,12 +1295,104 @@ void drawPage3Update() {
     tft->fillRect(83, 151, 74, 10, COLOR_BG);
     tft->drawString(buf, 120, 156);
 
+    // ChiszIlence1: aciertos (verde) y fallos (azul) — solo si activo
+    {
+        uint8_t mostrarAc = 0, mostrarFa = 0;
+        bool mostrarCz1 = false;
+        if (chiszActivo && chiszIdx == 1) {
+            if (esActual) {
+                mostrarAc  = chisz1Aciertos;
+                mostrarFa  = chisz1Fallos;
+                mostrarCz1 = true;
+            } else {
+                uint8_t idx = viewIdx - 1;
+                if (idx >= sesionCount) idx = 0;
+                mostrarAc  = sesionLog[idx].chisz1Aciertos;
+                mostrarFa  = sesionLog[idx].chisz1Fallos;
+                mostrarCz1 = (mostrarAc > 0 || mostrarFa > 0);
+            }
+        }
+        tft->fillRect(60, 164, 120, 12, COLOR_BG);
+        if (mostrarCz1) {
+            tft->setTextFont(1);
+            tft->setTextDatum(MC_DATUM);
+            // Aciertos en verde
+            char acBuf[8], faBuf[8];
+            snprintf(acBuf, sizeof(acBuf), "OK:%u", (unsigned)mostrarAc);
+            snprintf(faBuf, sizeof(faBuf), "FL:%u", (unsigned)mostrarFa);
+            tft->setTextColor(COLOR_OK, COLOR_BG);
+            tft->drawString(acBuf, 90, 170);
+            tft->setTextColor(TFT_BLUE, COLOR_BG);
+            tft->drawString(faBuf, 150, 170);
+        }
+    }
+
     // Badge usuario + indicadores AM + boton START (solo en vista actual)
     if (esActual) {
         drawUserBadge();
         drawAMBadge();
         drawStartButton();
     }
+
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PAGINA 6 — MENU2
+// ════════════════════════════════════════════════════════════════════════════
+
+void drawPage6Full() {
+    tft->fillScreen(COLOR_BG);
+    drawHeader("MENU2", true);
+
+    tft->fillRoundRect(btnP7.x, btnP7.y, btnP7.w, btnP7.h, 8, COLOR_BTN3);
+    tft->drawRoundRect(btnP7.x, btnP7.y, btnP7.w, btnP7.h, 8, TFT_WHITE);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(4);
+    tft->setTextColor(TFT_WHITE, COLOR_BTN3);
+    tft->drawString("CHISZILENCES", btnP7.x + btnP7.w / 2, btnP7.y + btnP7.h / 2);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PAGINA 7 — CHISZILENCES
+// ════════════════════════════════════════════════════════════════════════════
+
+void drawPage7Full() {
+    tft->fillScreen(COLOR_BG);
+    drawHeader("CHISZILENCES", true);
+
+    // Flechas selector (estaticas)
+    drawArrowSes(btnChiszDown, true,  true);
+    drawArrowSes(btnChiszUp,   false, true);
+}
+
+void drawPage7Update() {
+    char buf[16];
+
+    // Nombre del ChiszIlence seleccionado (centro)
+    tft->fillRect(60, 64, 120, 70, COLOR_BG);
+    snprintf(buf, sizeof(buf), "ChiszIlence%u", (unsigned)chiszIdx);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->setTextColor(COLOR_VALUE, COLOR_BG);
+    tft->drawString(buf, 120, 110);
+
+    // Flechas con estado habilitado/deshabilitado
+    drawArrowSes(btnChiszDown, true,  chiszIdx > 1);
+    drawArrowSes(btnChiszUp,   false, chiszIdx < CHISZ_MAX);
+
+    // Boton ACTIVA / DESACTIVA
+    uint16_t colToggle = chiszActivo ? COLOR_OK : COLOR_ERR;
+    const char *labelToggle = chiszActivo ? "ACTIVO" : "DESACTIVADO";
+    tft->fillRoundRect(btnChiszToggle.x, btnChiszToggle.y,
+                       btnChiszToggle.w, btnChiszToggle.h, 8, colToggle);
+    tft->drawRoundRect(btnChiszToggle.x, btnChiszToggle.y,
+                       btnChiszToggle.w, btnChiszToggle.h, 8, TFT_WHITE);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(4);
+    tft->setTextColor(TFT_WHITE, colToggle);
+    tft->drawString(labelToggle,
+                    btnChiszToggle.x + btnChiszToggle.w / 2,
+                    btnChiszToggle.y + btnChiszToggle.h / 2);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1383,10 +1667,35 @@ void cargarDatosUsuario(uint8_t u) {
 
     if (sesionCount > 0) {
         makeKey(k, "slog", u);
-        size_t expected = sizeof(SesionEntry) * sesionCount;   // 17 bytes/entry (v5)
+        size_t expected = sizeof(SesionEntry) * sesionCount;   // 19 bytes/entry (v6)
         size_t got = prefs.getBytes(k, sesionLog, expected);
         if (got == expected) {
-            // formato actual (v5), cargado tal cual.
+            // formato actual (v6), cargado tal cual.
+        } else if (got == 17u * sesionCount) {
+            // Formato v5 (17 bytes/entry, sin chisz1Aciertos/Fallos). Reinterpretar.
+            uint8_t raw[17 * HIST_LEN];
+            prefs.getBytes(k, raw, got);
+            for (int i = sesionCount - 1; i >= 0; i--) {
+                uint8_t *src = raw + (i * 17);
+                sesionLog[i].num         = ((uint32_t)src[0])        |
+                                           ((uint32_t)src[1] << 8)   |
+                                           ((uint32_t)src[2] << 16)  |
+                                           ((uint32_t)src[3] << 24);
+                sesionLog[i].cohFinales  = (uint16_t)src[4] | ((uint16_t)src[5] << 8);
+                sesionLog[i].duracionSeg = (uint16_t)src[6] | ((uint16_t)src[7] << 8);
+                sesionLog[i].umbralUsado = src[8];
+                sesionLog[i].objetivoMin = src[9];
+                sesionLog[i].gpxsUsado   = src[10];
+                sesionLog[i].timestamp   = ((uint32_t)src[11])       |
+                                           ((uint32_t)src[12] << 8)  |
+                                           ((uint32_t)src[13] << 16) |
+                                           ((uint32_t)src[14] << 24);
+                sesionLog[i].avgAttFinal    = src[15];
+                sesionLog[i].avgMedFinal    = src[16];
+                sesionLog[i].chisz1Aciertos = 0;
+                sesionLog[i].chisz1Fallos   = 0;
+            }
+            Serial.println("[NVS] log migrado v5 -> v6 (chisz1 sin dato historico)");
         } else if (got == 15u * sesionCount) {
             // Formato v4 (15 bytes/entry, sin avgAttFinal/avgMedFinal). Reinterpretar.
             uint8_t raw[15 * HIST_LEN];
@@ -1406,10 +1715,12 @@ void cargarDatosUsuario(uint8_t u) {
                                            ((uint32_t)src[12] << 8)  |
                                            ((uint32_t)src[13] << 16) |
                                            ((uint32_t)src[14] << 24);
-                sesionLog[i].avgAttFinal = 0;
-                sesionLog[i].avgMedFinal = 0;
+                sesionLog[i].avgAttFinal    = 0;
+                sesionLog[i].avgMedFinal    = 0;
+                sesionLog[i].chisz1Aciertos = 0;
+                sesionLog[i].chisz1Fallos   = 0;
             }
-            Serial.println("[NVS] log migrado v4 -> v5 (avgAtt/avgMed sin dato historico)");
+            Serial.println("[NVS] log migrado v4 -> v6");
         } else if (got == 11u * sesionCount) {
             // Formato v3 (11 bytes/entry, sin timestamp). Reinterpretar.
             uint8_t raw[11 * HIST_LEN];
@@ -1425,11 +1736,13 @@ void cargarDatosUsuario(uint8_t u) {
                 sesionLog[i].umbralUsado = src[8];
                 sesionLog[i].objetivoMin = src[9];
                 sesionLog[i].gpxsUsado   = src[10];
-                sesionLog[i].timestamp   = 0;
-                sesionLog[i].avgAttFinal = 0;
-                sesionLog[i].avgMedFinal = 0;
+                sesionLog[i].timestamp      = 0;
+                sesionLog[i].avgAttFinal    = 0;
+                sesionLog[i].avgMedFinal    = 0;
+                sesionLog[i].chisz1Aciertos = 0;
+                sesionLog[i].chisz1Fallos   = 0;
             }
-            Serial.println("[NVS] log migrado v3 -> v5 (timestamp/avgAtt/avgMed sin dato historico)");
+            Serial.println("[NVS] log migrado v3 -> v6");
         } else if (got == 10u * sesionCount) {
             // Formato v2 (10 bytes/entry, sin gpxsUsado ni timestamp).
             uint8_t raw[10 * HIST_LEN];
@@ -1442,14 +1755,16 @@ void cargarDatosUsuario(uint8_t u) {
                                            ((uint32_t)src[3] << 24);
                 sesionLog[i].cohFinales  = (uint16_t)src[4] | ((uint16_t)src[5] << 8);
                 sesionLog[i].duracionSeg = (uint16_t)src[6] | ((uint16_t)src[7] << 8);
-                sesionLog[i].umbralUsado = src[8];
-                sesionLog[i].objetivoMin = src[9];
-                sesionLog[i].gpxsUsado   = 0;
-                sesionLog[i].timestamp   = 0;
-                sesionLog[i].avgAttFinal = 0;
-                sesionLog[i].avgMedFinal = 0;
+                sesionLog[i].umbralUsado    = src[8];
+                sesionLog[i].objetivoMin    = src[9];
+                sesionLog[i].gpxsUsado      = 0;
+                sesionLog[i].timestamp      = 0;
+                sesionLog[i].avgAttFinal    = 0;
+                sesionLog[i].avgMedFinal    = 0;
+                sesionLog[i].chisz1Aciertos = 0;
+                sesionLog[i].chisz1Fallos   = 0;
             }
-            Serial.println("[NVS] log migrado v2 -> v5 (gpxs/timestamp/avgAtt/avgMed sin dato historico)");
+            Serial.println("[NVS] log migrado v2 -> v6");
         } else if (got == 8u * sesionCount) {
             // Formato v1 (8 bytes/entry, sin umbral/objetivo/gpxs/timestamp).
             uint8_t raw[8 * HIST_LEN];
@@ -1462,14 +1777,16 @@ void cargarDatosUsuario(uint8_t u) {
                                            ((uint32_t)src[3] << 24);
                 sesionLog[i].cohFinales  = (uint16_t)src[4] | ((uint16_t)src[5] << 8);
                 sesionLog[i].duracionSeg = (uint16_t)src[6] | ((uint16_t)src[7] << 8);
-                sesionLog[i].umbralUsado = 0;
-                sesionLog[i].objetivoMin = 0;
-                sesionLog[i].gpxsUsado   = 0;
-                sesionLog[i].timestamp   = 0;
-                sesionLog[i].avgAttFinal = 0;
-                sesionLog[i].avgMedFinal = 0;
+                sesionLog[i].umbralUsado    = 0;
+                sesionLog[i].objetivoMin    = 0;
+                sesionLog[i].gpxsUsado      = 0;
+                sesionLog[i].timestamp      = 0;
+                sesionLog[i].avgAttFinal    = 0;
+                sesionLog[i].avgMedFinal    = 0;
+                sesionLog[i].chisz1Aciertos = 0;
+                sesionLog[i].chisz1Fallos   = 0;
             }
-            Serial.println("[NVS] log migrado v1 -> v5 (sin umbral/objetivo/gpxs/timestamp/avgAtt/avgMed)");
+            Serial.println("[NVS] log migrado v1 -> v6");
         } else {
             sesionCount = 0;   // corrupcion -> empezar limpio
         }
@@ -1487,6 +1804,13 @@ void cargarDatosUsuario(uint8_t u) {
     makeKey(k, "gpxs", u);
     gapaxionsz = (uint8_t) prefs.getUChar(k, GPXS_DEF);
     if (gapaxionsz < GPXS_MIN || gapaxionsz > GPXS_MAX) gapaxionsz = GPXS_DEF;
+
+    makeKey(k, "chsz", u);
+    chiszIdx = (uint8_t) prefs.getUChar(k, CHISZ_DEF);
+    if (chiszIdx < 1 || chiszIdx > CHISZ_MAX) chiszIdx = CHISZ_DEF;
+
+    makeKey(k, "chac", u);
+    chiszActivo = prefs.getBool(k, false);
 
     autoCierreDisparado = false;
     sesionEnEspera      = true;
@@ -1535,6 +1859,14 @@ void guardarGpxsUsuario() {
     char k[8];
     makeKey(k, "gpxs", usuarioActivo);
     prefs.putUChar(k, gapaxionsz);
+}
+
+void guardarChiszUsuario() {
+    char k[8];
+    makeKey(k, "chsz", usuarioActivo);
+    prefs.putUChar(k, chiszIdx);
+    makeKey(k, "chac", usuarioActivo);
+    prefs.putBool(k, chiszActivo);
 }
 
 // Borra TODAS las sesiones guardadas del usuario activo y reinicia la
@@ -1605,8 +1937,10 @@ void anadirSesionAlLog(uint32_t num, uint16_t coh, uint16_t duracionSeg,
     sesionLog[0].objetivoMin = objetivoMin;
     sesionLog[0].gpxsUsado   = gpxs;
     sesionLog[0].timestamp   = leerTimestampRTC();
-    sesionLog[0].avgAttFinal = sesAvgSamples > 0 ? (uint8_t)(sesAvgAttSum / sesAvgSamples) : 0;
-    sesionLog[0].avgMedFinal = sesAvgSamples > 0 ? (uint8_t)(sesAvgMedSum / sesAvgSamples) : 0;
+    sesionLog[0].avgAttFinal    = sesAvgSamples > 0 ? (uint8_t)(sesAvgAttSum / sesAvgSamples) : 0;
+    sesionLog[0].avgMedFinal    = sesAvgSamples > 0 ? (uint8_t)(sesAvgMedSum / sesAvgSamples) : 0;
+    sesionLog[0].chisz1Aciertos = (chiszActivo && chiszIdx == 1) ? chisz1Aciertos : 0;
+    sesionLog[0].chisz1Fallos   = (chiszActivo && chiszIdx == 1) ? chisz1Fallos   : 0;
     // Resetear acumuladores para la proxima sesion
     sesAvgAttSum  = 0;
     sesAvgMedSum  = 0;
@@ -1835,7 +2169,7 @@ static void sdEnsureHeader(const char *path) {
     if (!SD.exists(path)) {
         fs::File f = SD.open(path, FILE_WRITE);
         if (f) {
-            f.println("num,coh,durSeg,cohPorMin,umbral,minutos,gpxs,avgAtt,avgMed,fecha,hora");
+            f.println("num,coh,durSeg,cohPorMin,umbral,minutos,gpxs,avgAtt,avgMed,chisz1_ac,chisz1_fl,fecha,hora");
             f.close();
         }
     }
@@ -1875,7 +2209,7 @@ void sdGuardarSesion(uint8_t u, const SesionEntry &s) {
     if (cpmDec >= 100) { cpmInt++; cpmDec = 0; }
     char cpmBuf[10];
     snprintf(cpmBuf, sizeof(cpmBuf), "%u.%02u", (unsigned)cpmInt, (unsigned)cpmDec);
-    f.printf("%lu,%u,%u,%s,%u,%u,%u,%u,%u,%s,%s\n",
+    f.printf("%lu,%u,%u,%s,%u,%u,%u,%u,%u,%u,%u,%s,%s\n",
              (unsigned long)s.num,
              (unsigned)s.cohFinales,
              (unsigned)s.duracionSeg,
@@ -1885,6 +2219,8 @@ void sdGuardarSesion(uint8_t u, const SesionEntry &s) {
              (unsigned)s.gpxsUsado,
              (unsigned)s.avgAttFinal,
              (unsigned)s.avgMedFinal,
+             (unsigned)s.chisz1Aciertos,
+             (unsigned)s.chisz1Fallos,
              fechaBuf,
              horaBuf);
     f.close();
@@ -1929,6 +2265,9 @@ void setup() {
         watch->drv->selectLibrary(1);
         watch->drv->setMode(DRV2605_MODE_INTTRIG);
     }
+
+    // BMA423 (acelerometro): necesario para ChiszIlence1
+    watch->bma->begin();
 
     // NVS: cargar usuario activo y sus datos (log + proxima sesion + umbral).
     prefs.begin("watchcoh", false);
@@ -1985,6 +2324,7 @@ void handleTouch(int16_t tx, int16_t ty) {
             else if (btnP2.dentro(tx, ty)) setPage(2);
             else if (btnP3.dentro(tx, ty)) setPage(3);
             else if (btnP4.dentro(tx, ty)) setPage(4);
+            else if (btnP6.dentro(tx, ty)) setPage(6);
             break;
 
         case 2:
@@ -2050,6 +2390,10 @@ void handleTouch(int16_t tx, int16_t ty) {
                     enviarUmbralAB();
                     umbralLocalDirty = false;
                     needFullRedraw   = true;
+                    // Arrancar ChiszIlence1 si está activo
+                    if (chiszActivo && chiszIdx == 1) {
+                        chisz1Start();
+                    }
                 }
                 // Si sesion ya corriendo: ignorar
             } else if (btnGuardar.dentro(tx, ty)) {
@@ -2160,6 +2504,27 @@ void handleTouch(int16_t tx, int16_t ty) {
             if (redraw) drawPage5Update();
             break;
         }
+
+        case 6:   // MENU2
+            if (btnP7.dentro(tx, ty)) setPage(7);
+            break;
+
+        case 7: {  // CHISZILENCES
+            bool redraw7 = false;
+            if (btnChiszDown.dentro(tx, ty)) {
+                if (chiszIdx > 1) { chiszIdx--; redraw7 = true; }
+            } else if (btnChiszUp.dentro(tx, ty)) {
+                if (chiszIdx < CHISZ_MAX) { chiszIdx++; redraw7 = true; }
+            } else if (btnChiszToggle.dentro(tx, ty)) {
+                chiszActivo = !chiszActivo;
+                redraw7 = true;
+            }
+            if (redraw7) {
+                guardarChiszUsuario();
+                drawPage7Update();
+            }
+            break;
+        }
     }
 }
 
@@ -2191,14 +2556,23 @@ void loop() {
             sesAvgSamples++;
         }
 
-        // Disparar vibracion en evento nuevo (no si la sesion ya termino)
+        // Disparar vibracion en evento nuevo (no si la sesion ya termino,
+        // y no si ChiszIlence1 está activo — usa su propio sistema de vibración)
         if (paqueteRx.nuevoEvento && !vibrando && !sesionEnEspera) {
-            vibrarStart();
+            bool chisz1Running = (chiszActivo && chiszIdx == 1 && chisz1Estado != CZ1_OFF);
+            if (!chisz1Running) {
+                vibrarStart();
+            }
         }
     }
 
     // 2. Vibracion tick
     vibrarTick(now);
+
+    // 2a. ChiszIlence1 tick (solo si sesión activa)
+    if (chiszActivo && chiszIdx == 1 && !sesionEnEspera && !sesionNoIniciada) {
+        chisz1Tick(now);
+    }
 
     // 2b. Lectura periodica de bateria (no bloqueante)
     if (now - batteryLastRead >= BATTERY_POLL_MS) {
@@ -2224,6 +2598,7 @@ void loop() {
             sesionEnEspera  = true;
             sesionPausadaMs = safeElapsed(now, sesionStartMs);
             cohCongeladas   = uiNumCoherencias;
+            chisz1Stop();
             vibrarCierre();
             // Guardar automaticamente; la siguiente sesion espera START del usuario
             arrancarTrasEco = false;
@@ -2263,6 +2638,8 @@ void loop() {
                 if (cambioUser == CU_CONFIRM) drawCambioUserModal();
                 break;
             case 5: drawPage5Full(); break;
+            case 6: drawPage6Full(); break;
+            case 7: drawPage7Full(); drawPage7Update(); break;
         }
         lastUiUpdate = 0;   // forzar update inmediato
     }
@@ -2299,6 +2676,8 @@ void loop() {
                 if (cambioUser != CU_CONFIRM) drawPage4Update();
                 break;
             case 5: drawPage5Update(); break;
+            case 6: break;   // pagina 6 es estatica
+            case 7: break;   // pagina 7 se actualiza solo tras toque
         }
     }
 
