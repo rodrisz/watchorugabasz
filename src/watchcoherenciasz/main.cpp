@@ -143,8 +143,8 @@ bool     chiszActivo = false;        // true = un ChiszIlence está activo
 // Vibracion seal: 1 pulso = mantener quieto, 2 pulsos = flexion de muneca.
 // Evaluacion BMA423: varianza eje Z (quietud) + pico eje Z (flexion).
 #define CZ1_WAIT_MS        10000UL  // 10s pre-vibración y 10s post-vibración
-#define CZ1_ZVAR_UMBRAL    300      // varianza eje Z²: por debajo = quieto
-#define CZ1_ZPICO_UMBRAL   500      // pico eje Z (desviación de reposo): encima = flexión
+#define CZ1_ZVAR_UMBRAL    1500     // varianza eje Z²: por debajo = quieto
+#define CZ1_ZPICO_UMBRAL   200      // pico eje Z (desviación de reposo): encima = flexión
 
 enum Chisz1State {
     CZ1_OFF,       // desactivado o sesion no iniciada
@@ -169,8 +169,8 @@ uint16_t    cz1ZSamples     = 0;
 uint32_t    cz1BmaLastMs    = 0;     // ultima lectura BMA423
 #define     CZ1_BMA_INTERVAL_MS  50  // leer BMA cada 50ms durante LECTURA
 
-// Patron de vibracion senal (1 pulso = efecto 1, 2 pulsos = efectos 1+1)
-static const uint8_t VIBRATE_PATTERN_CZ1[] = { 1, 1 };  // Strong Click x2
+// Patron de vibracion senal (1 pulso = efecto 14, 2 pulsos = efectos 14+14)
+static const uint8_t VIBRATE_PATTERN_CZ1[] = { 14, 14 };  // Strong Buzz 100% x2
 
 // Sesion (pagina 3)
 Preferences prefs;
@@ -518,6 +518,16 @@ void chisz1Start() {
     chisz1Estado   = CZ1_PRE_WAIT;
     chisz1PhaseMs  = millis();
     cz1ResetAcum();
+    // Re-activar acelerómetro: puede entrar en bajo consumo entre sesiones
+    if (watch && watch->bma) {
+        watch->bma->enableAccel();
+        Acfg cfg;
+        cfg.odr       = BMA4_OUTPUT_DATA_RATE_100HZ;
+        cfg.range     = BMA4_ACCEL_RANGE_4G;
+        cfg.bandwidth = BMA4_ACCEL_NORMAL_AVG4;
+        cfg.perf_mode = BMA4_CONTINUOUS_MODE;
+        watch->bma->accelConfig(cfg);
+    }
     Serial.println("[CZ1] iniciado");
 }
 
@@ -531,9 +541,9 @@ void chisz1Stop() {
 static void cz1Vibrar(uint8_t senal) {
     if (!watch || !watch->drv) return;
     if (senal == 1) {
-        vibrarStartPattern(VIBRATE_PATTERN_CZ1, 1, 400UL, 800UL);
+        vibrarStartPattern(VIBRATE_PATTERN_CZ1, 1, 600UL, 1200UL);
     } else {
-        vibrarStartPattern(VIBRATE_PATTERN_CZ1, 2, 400UL, 1200UL);
+        vibrarStartPattern(VIBRATE_PATTERN_CZ1, 2, 600UL, 1800UL);
     }
 }
 
@@ -577,23 +587,11 @@ void chisz1Tick(uint32_t now) {
             break;
 
         case CZ1_VIBRA:
-            // Leer BMA ya durante la fase de vibración para no perder muestras
-            if (now - cz1BmaLastMs >= CZ1_BMA_INTERVAL_MS) {
-                cz1BmaLastMs = now;
-                if (watch && watch->bma) {
-                    Accel acc;
-                    if (watch->bma->getAccel(acc)) {
-                        int32_t z = (int32_t)acc.z;
-                        cz1ZSum   += z;
-                        cz1ZSumSq += z * z;
-                        if (z > cz1ZMax) cz1ZMax = z;
-                        if (z < cz1ZMin) cz1ZMin = z;
-                        cz1ZSamples++;
-                    }
-                }
-            }
-            // Esperar a que la vibración termine + ir a LECTURA
+            // No leer BMA durante la vibración — el motor contamina el eje Z.
+            // Esperar a que termine y pasar a LECTURA con acumuladores limpios.
             if (!vibrando && now - chisz1PhaseMs >= 600UL) {
+                cz1ResetAcum();
+                cz1BmaLastMs  = now;
                 chisz1Estado  = CZ1_LECTURA;
                 chisz1PhaseMs = now;
             }
@@ -625,14 +623,23 @@ void chisz1Tick(uint32_t now) {
             bool huboFlexion = cz1EvalFlexion();
             bool estuvoQuieto = cz1EvalQuieto();
             bool esAcierto = (chisz1Signal == 1) ? estuvoQuieto : huboFlexion;
+            // Calcular valores para debug
+            int32_t dbgMedia = (cz1ZSamples > 0) ? cz1ZSum / (int32_t)cz1ZSamples : 0;
+            int32_t dbgPicoPos = cz1ZMax - dbgMedia;
+            int32_t dbgPicoNeg = dbgMedia - cz1ZMin;
+            int32_t dbgPico = (dbgPicoPos > dbgPicoNeg) ? dbgPicoPos : dbgPicoNeg;
+            int32_t dbgMeanSq = (cz1ZSamples > 0) ? cz1ZSumSq / (int32_t)cz1ZSamples : 0;
+            int32_t dbgVar = dbgMeanSq - (dbgMedia * dbgMedia);
+            if (dbgVar < 0) dbgVar = -dbgVar;
+            Serial.printf("[CZ1] senal=%u muestras=%u media=%ld var=%ld pico=%ld | quieto=%d flex=%d -> %s\n",
+                          (unsigned)chisz1Signal, (unsigned)cz1ZSamples,
+                          (long)dbgMedia, (long)dbgVar, (long)dbgPico,
+                          (int)estuvoQuieto, (int)huboFlexion,
+                          esAcierto ? "ACIERTO" : "FALLO");
             if (esAcierto) {
                 if (chisz1Aciertos < 255) chisz1Aciertos++;
-                Serial.printf("[CZ1] ACIERTO (senal=%u, quieto=%d, flex=%d)\n",
-                              (unsigned)chisz1Signal, (int)estuvoQuieto, (int)huboFlexion);
             } else {
                 if (chisz1Fallos < 255) chisz1Fallos++;
-                Serial.printf("[CZ1] FALLO (senal=%u, quieto=%d, flex=%d)\n",
-                              (unsigned)chisz1Signal, (int)estuvoQuieto, (int)huboFlexion);
             }
             cz1ResetAcum();
             chisz1Estado  = CZ1_PRE_WAIT;
@@ -2053,6 +2060,9 @@ void tickSesionBtn(uint32_t now) {
                 sesionEnEspera      = !arrancarTrasEco;
                 sesionNoIniciada    = false;   // no es virgen: hay una sesion previa guardada
                 sesionPausadaMs     = 0;
+                if (!sesionEnEspera && chiszActivo && chiszIdx == 1) {
+                    chisz1Start();
+                }
                 arrancarTrasEco     = false;
                 needFullRedraw      = true;   // refresca pagina entera (numeros nuevos)
                 sesionBtn      = SBTN_OK;
@@ -2268,6 +2278,15 @@ void setup() {
 
     // BMA423 (acelerometro): necesario para ChiszIlence1
     watch->bma->begin();
+    watch->bma->enableAccel();
+    {
+        Acfg cfg;
+        cfg.odr        = BMA4_OUTPUT_DATA_RATE_100HZ;
+        cfg.range      = BMA4_ACCEL_RANGE_4G;
+        cfg.bandwidth  = BMA4_ACCEL_NORMAL_AVG4;
+        cfg.perf_mode  = BMA4_CONTINUOUS_MODE;
+        watch->bma->accelConfig(cfg);
+    }
 
     // NVS: cargar usuario activo y sus datos (log + proxima sesion + umbral).
     prefs.begin("watchcoh", false);
