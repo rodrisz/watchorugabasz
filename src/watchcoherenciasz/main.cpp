@@ -311,7 +311,7 @@ struct Boton {
 Boton btnMenu     = { 5, 5, 60, HEADER_H };
 
 // Pagina 0: 5 botones compactos
-Boton btnP1 = { 20,  48, 200, 32 };   // DATOS
+Boton btnP1 = { 20,  48,  95, 32 };   // DATOS (mitad izquierda)
 Boton btnP2 = { 20,  84, 200, 32 };   // UMBRAL
 Boton btnP3 = { 20, 120, 200, 32 };   // SESION
 Boton btnP4 = { 20, 156, 200, 32 };   // USUARIO
@@ -761,6 +761,30 @@ void drawLinkStatus(uint32_t now) {
     tft->drawString(linkUp ? "LINK OK" : "LINK--", 234, HEADER_H / 2);
 }
 
+// Indicador de conexion y señal NeuroSky en pagina 0.
+// Ocupa la mitad derecha del espacio del boton btnP1 (x=120..220, y=48, h=32).
+void drawNeuroSkyStatus() {
+    const int16_t x = 120, y = 48, w = 100, h = 32;
+    uint16_t col;
+    const char *label;
+    if (!uiBtConnected) {
+        col   = COLOR_ERR;    // rojo: sin conexion BT
+        label = "NS: OFF";
+    } else if (uiPoorSignal > 0) {
+        col   = TFT_YELLOW;   // amarillo: conectado, señal pobre
+        label = "NS: ~";
+    } else {
+        col   = COLOR_OK;     // verde: conectado, señal buena
+        label = "NS: OK";
+    }
+    tft->fillRoundRect(x, y, w, h, 6, col);
+    tft->drawRoundRect(x, y, w, h, 6, TFT_WHITE);
+    tft->setTextColor(TFT_BLACK, col);
+    tft->setTextDatum(MC_DATUM);
+    tft->setTextFont(2);
+    tft->drawString(label, x + w / 2, y + h / 2);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 //  PAGINA 0 — MENU
 // ════════════════════════════════════════════════════════════════════════════
@@ -791,6 +815,7 @@ void drawPage0Full() {
     };
 
     drawBtn(btnP1, "1 DATOS",   COLOR_BTN);
+    drawNeuroSkyStatus();
     drawBtn(btnP2, "2 UMBRAL",  COLOR_BTN2);
     drawBtn(btnP3, "3 SESION",  COLOR_BTN3);
     drawBtn(btnP6, "5 MENU2",   COLOR_BTN3);
@@ -804,6 +829,9 @@ void drawPage0Full() {
 void drawPage0Update(uint32_t now) {
     // Bateria en header
     drawBatteryWidget(5, 8);
+
+    // Indicador NeuroSky (puede cambiar con cada paquete recibido)
+    drawNeuroSkyStatus();
 
     // Boton USUARIO: redibuja solo su texto (numero de usuario puede cambiar)
     char buf[16];
@@ -1258,7 +1286,7 @@ void drawPage3Update() {
             showAvgMed = sesionLog[idx].avgMedFinal;
             showAvgAtt = sesionLog[idx].avgAttFinal;
         }
-        tft->setTextFont(1);
+        tft->setTextFont(2);
         tft->setTextColor(COLOR_LABEL, COLOR_BG);
         // Bajo flecha izq (centro x=32): "Md:XX" o "Md:--"
         if (showAvgMed > 0) {
@@ -1267,7 +1295,7 @@ void drawPage3Update() {
             snprintf(buf, sizeof(buf), "Md:--");
         }
         tft->setTextDatum(TC_DATUM);
-        tft->fillRect(5, 151, 55, 10, COLOR_BG);
+        tft->fillRect(5, 151, 55, 16, COLOR_BG);
         tft->drawString(buf, 32, 152);
         // Bajo flecha der (centro x=207): "At:XX" o "At:--"
         if (showAvgAtt > 0) {
@@ -1275,7 +1303,7 @@ void drawPage3Update() {
         } else {
             snprintf(buf, sizeof(buf), "At:--");
         }
-        tft->fillRect(180, 151, 55, 10, COLOR_BG);
+        tft->fillRect(180, 151, 55, 16, COLOR_BG);
         tft->drawString(buf, 207, 152);
     }
 
@@ -1299,8 +1327,8 @@ void drawPage3Update() {
     }
     tft->setTextFont(1);
     tft->setTextColor(COLOR_LABEL, COLOR_BG);
-    tft->fillRect(83, 151, 74, 10, COLOR_BG);
-    tft->drawString(buf, 120, 156);
+    tft->fillRect(83, 151, 74, 16, COLOR_BG);
+    tft->drawString(buf, 120, 159);
 
     // ChiszIlence1: aciertos (verde) y fallos (azul) — solo si activo
     {
@@ -1319,9 +1347,9 @@ void drawPage3Update() {
                 mostrarCz1 = (mostrarAc > 0 || mostrarFa > 0);
             }
         }
-        tft->fillRect(60, 164, 120, 12, COLOR_BG);
+        tft->fillRect(60, 164, 120, 18, COLOR_BG);
         if (mostrarCz1) {
-            tft->setTextFont(1);
+            tft->setTextFont(2);
             tft->setTextDatum(MC_DATUM);
             // Aciertos en verde
             char acBuf[8], faBuf[8];
