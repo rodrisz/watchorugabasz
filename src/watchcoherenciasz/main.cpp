@@ -160,6 +160,28 @@ uint8_t     chisz1Signal    = 0;     // 1 = quietud, 2 = flexion (aleatorio)
 uint8_t     chisz1Aciertos  = 0;     // aciertos acumulados en sesion
 uint8_t     chisz1Fallos    = 0;     // fallos acumulados en sesion
 
+// Shuffle bag para señal CZ1: garantiza distribucion 50/50 sin rachas largas.
+// Bolsa de 4 fichas (2x señal-1, 2x señal-2). Se baraja al vaciarse.
+#define CZ1_BAG_SIZE 4
+static uint8_t cz1Bag[CZ1_BAG_SIZE];
+static uint8_t cz1BagIdx = CZ1_BAG_SIZE;  // CZ1_BAG_SIZE = bolsa vacia, fuerza relleno
+
+static void cz1BagRefill() {
+    cz1Bag[0] = 1; cz1Bag[1] = 1;
+    cz1Bag[2] = 2; cz1Bag[3] = 2;
+    // Fisher-Yates shuffle
+    for (uint8_t i = CZ1_BAG_SIZE - 1; i > 0; i--) {
+        uint8_t j = random(i + 1);
+        uint8_t tmp = cz1Bag[i]; cz1Bag[i] = cz1Bag[j]; cz1Bag[j] = tmp;
+    }
+    cz1BagIdx = 0;
+}
+
+static uint8_t cz1BagNext() {
+    if (cz1BagIdx >= CZ1_BAG_SIZE) cz1BagRefill();
+    return cz1Bag[cz1BagIdx++];
+}
+
 // Acumuladores BMA423 durante la fase LECTURA
 int32_t     cz1ZSum         = 0;
 int32_t     cz1ZSumSq       = 0;
@@ -575,8 +597,8 @@ void chisz1Tick(uint32_t now) {
 
         case CZ1_PRE_WAIT:
             if (now - chisz1PhaseMs >= CZ1_WAIT_MS) {
-                // Elegir senal aleatoria
-                chisz1Signal   = (random(2) == 0) ? 1 : 2;
+                // Elegir senal aleatoria (shuffle bag: 50/50 garantizado sin rachas)
+                chisz1Signal   = cz1BagNext();
                 chisz1Estado  = CZ1_VIBRA;
                 chisz1PhaseMs = now;
                 cz1ResetAcum();
