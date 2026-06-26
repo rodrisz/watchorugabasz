@@ -2087,7 +2087,9 @@ void tickSesionBtn(uint32_t now) {
             break;
         case SBTN_WAIT_ECHO:
             // Eco exitoso: llego un paquete POSTERIOR al envio con numCoherencias=0
-            if (paqueteRx.seq > seqAlPedir && uiNumCoherencias == 0) {
+            // Usamos paqueteRx.numCoherencias directamente (no uiNumCoherencias, que
+            // no se actualiza mientras sesionEnEspera=true por el gate de sesionActiva)
+            if (paqueteRx.seq > seqAlPedir && paqueteRx.numCoherencias == 0) {
                 // Confirmado por A → recien ahora persistimos la sesion cerrada
                 // y avanzamos el contador. Si timeout-eamos no se toca nada.
                 anadirSesionAlLog(sesionActual, cohAlGuardar, duracionAlGuardar,
@@ -2110,6 +2112,7 @@ void tickSesionBtn(uint32_t now) {
                 sesionEnEspera      = !arrancarTrasEco;
                 sesionNoIniciada    = false;   // no es virgen: hay una sesion previa guardada
                 sesionPausadaMs     = 0;
+                uiNumCoherencias    = 0;
                 if (!sesionEnEspera && chiszActivo && chiszIdx == 1) {
                     chisz1Start();
                 }
@@ -2456,6 +2459,7 @@ void handleTouch(int16_t tx, int16_t ty) {
                     sesionNoIniciada    = false;
                     sesionPausadaMs     = 0;
                     autoCierreDisparado = false;
+                    uiNumCoherencias    = 0;
                     enviarUmbralAB();
                     umbralLocalDirty = false;
                     needFullRedraw   = true;
@@ -2607,15 +2611,21 @@ void loop() {
     // 1. Refrescar cache desde el ultimo paquete RX
     if (hayNuevoPaquete) {
         hayNuevoPaquete  = false;
-        uiBtConnected    = paqueteRx.btConnected;
-        uiPoorSignal     = paqueteRx.poorSignal;
-        uiAttention      = paqueteRx.attention;
-        uiMeditation     = paqueteRx.meditation;
-        uiNumCoherencias = paqueteRx.numCoherencias;
-        uiUmbralActivo   = paqueteRx.umbralActivo;
+        uiBtConnected  = paqueteRx.btConnected;
+        uiPoorSignal   = paqueteRx.poorSignal;
+        uiAttention    = paqueteRx.attention;
+        uiMeditation   = paqueteRx.meditation;
+        uiUmbralActivo = paqueteRx.umbralActivo;
+
+        bool sesionActiva = !sesionNoIniciada && !sesionEnEspera;
+
+        // Coherencias: solo se actualizan si la sesion esta en curso
+        if (sesionActiva) {
+            uiNumCoherencias = paqueteRx.numCoherencias;
+        }
 
         // Acumular en buffer de promedios AM (solo con senial valida y sesion activa)
-        if (uiPoorSignal == 0 && uiBtConnected && !sesionEnEspera && !sesionNoIniciada) {
+        if (sesionActiva && uiPoorSignal == 0 && uiBtConnected) {
             attBuf[amBufIdx] = uiAttention;
             medBuf[amBufIdx] = uiMeditation;
             amBufIdx = (amBufIdx + 1) % 3;
@@ -2625,9 +2635,9 @@ void loop() {
             sesAvgSamples++;
         }
 
-        // Disparar vibracion en evento nuevo (no si la sesion ya termino,
+        // Disparar vibracion en evento nuevo (solo si sesion activa,
         // y no si ChiszIlence1 está activo — usa su propio sistema de vibración)
-        if (paqueteRx.nuevoEvento && !vibrando && !sesionEnEspera) {
+        if (sesionActiva && paqueteRx.nuevoEvento && !vibrando) {
             bool chisz1Running = (chiszActivo && chiszIdx == 1 && chisz1Estado != CZ1_OFF);
             if (!chisz1Running) {
                 vibrarStart();
